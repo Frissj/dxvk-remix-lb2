@@ -43,3 +43,9 @@ metrics.txt
 nrc_session_log.txt
 python.dxvk-cache
 *.xml.user
+nv-private/
+.github/workflows/
+*.dll
+*.exe
+*.pdb
+*.lib

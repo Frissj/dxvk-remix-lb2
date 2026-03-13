@@ -75,6 +75,13 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
     ignoreAlphaChannel = lookupHash(RtxOptions::ignoreAlphaOnTextures(), getHash());
   }
   opaqueMat.setIgnoreAlphaChannel(ignoreAlphaChannel);
+
+  // Pink fallback for meshes without a valid texture
+  if (!usesTexture()) {
+    opaqueMat.setAlbedoConstant(Vector3(1.0f, 0.0f, 1.0f));
+    opaqueMat.setOpacityConstant(1.0f);
+  }
+
   return opaqueMat;
 }
 

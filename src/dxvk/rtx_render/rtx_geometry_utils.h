@@ -65,7 +65,8 @@ namespace dxvk {
      * \brief Currently we only support these texcoord formats...
      */
     static bool isTexcoordFormatValid(VkFormat format) {
-      return format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R32G32B32_SFLOAT || format == VK_FORMAT_R32G32_SFLOAT;
+      return format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R32G32B32_SFLOAT || format == VK_FORMAT_R32G32_SFLOAT
+          || format == VK_FORMAT_R16G16_SFLOAT || format == VK_FORMAT_R16G16B16A16_SFLOAT;
     }
 
     /**

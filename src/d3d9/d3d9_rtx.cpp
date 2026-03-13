@@ -17,9 +17,21 @@
 
 namespace dxvk {
   static const bool s_isDxvkResolutionEnvVarSet = (env::getEnvVar("DXVK_RESOLUTION_WIDTH") != "") || (env::getEnvVar("DXVK_RESOLUTION_HEIGHT") != "");
-  
+
   // We only look at RT 0 currently.
   const uint32_t kRenderTargetIndex = 0;
+
+  // ========================================================
+  // Texture/Shader Debug System
+  // ========================================================
+  static bool isTextureRT(IDirect3DBaseTexture9* tex) {
+    if (!tex) return false;
+    D3D9CommonTexture* commonTex = GetCommonTexture(tex);
+    if (commonTex && (commonTex->Desc()->Usage & D3DUSAGE_RENDERTARGET)) {
+      return true;
+    }
+    return false;
+  }
 
   #define CATEGORIES_REQUIRE_DRAW_CALL_STATE  InstanceCategories::Sky, InstanceCategories::Terrain
   #define CATEGORIES_REQUIRE_GEOMETRY_COPY    InstanceCategories::Terrain, InstanceCategories::WorldUI
@@ -160,12 +172,24 @@ namespace dxvk {
     geoData.positionBuffer = RasterBuffer(slice, 0, stride, VK_FORMAT_R32G32B32A32_SFLOAT);
     assert(geoData.positionBuffer.offset() % 4 == 0);
 
-    // Did we have a texcoord buffer bound for this draw?  Note, we currently get texcoord from the vertex shader output 
-    if (BoundShaderHas(vertexShader, DxsoUsage::Texcoord, false) && (!geoData.texcoordBuffer.defined() || !RtxGeometryUtils::isTexcoordFormatValid(geoData.texcoordBuffer.vertexFormat()))) {
+    // Did we have a texcoord buffer bound for this draw?  Note, we currently get texcoord from the vertex shader output
+    // When forceInputTexcoords is enabled, skip shader output texcoords to keep stable input vertex UVs.
+    const bool hasVsTexcoord = BoundShaderHas(vertexShader, DxsoUsage::Texcoord, false);
+    const bool inputTexcoordDefined = geoData.texcoordBuffer.defined() && RtxGeometryUtils::isTexcoordFormatValid(geoData.texcoordBuffer.vertexFormat());
+    const bool useVsCapture = !forceInputTexcoords() && hasVsTexcoord && !inputTexcoordDefined;
+    if (useVsCapture) {
       // Known offset for vertex capture buffers
       const uint32_t texcoordOffset = offsetof(CapturedVertex, texcoord0);
       geoData.texcoordBuffer = RasterBuffer(slice, texcoordOffset, stride, VK_FORMAT_R32G32_SFLOAT);
       assert(geoData.texcoordBuffer.offset() % 4 == 0);
+    }
+    if (m_drawCallID < 200) {
+      Logger::info(str::format("[RTX-UVSource] DC#", m_drawCallID,
+        " forceInput=", forceInputTexcoords() ? 1 : 0,
+        " vsHasTC=", hasVsTexcoord ? 1 : 0,
+        " inputTCDefined=", inputTexcoordDefined ? 1 : 0,
+        " usingVSCapture=", useVsCapture ? 1 : 0,
+        " texcoordIdx=", m_texcoordIndex));
     }
 
     // Check if we should/can get normals.  We don't see a lot of games sending normals to pixel shader, so we must capture from the IA output (or Vertex input)
@@ -208,6 +232,19 @@ namespace dxvk {
 
   void D3D9Rtx::processVertices(const VertexContext vertexContext[caps::MaxStreams], int vertexIndexOffset, RasterGeometry& geoData) {
     DxvkBufferSlice streamCopies[caps::MaxStreams] {};
+
+    // Log vertex declaration elements for debugging
+    if (m_drawCallID < 200) {
+      static uint32_t lastLoggedDC = UINT32_MAX;
+      if (m_drawCallID != lastLoggedDC) {
+        lastLoggedDC = m_drawCallID;
+        for (const auto& el : d3d9State().vertexDecl->GetElements()) {
+          Logger::info(str::format("[RTX-VtxDecl] Stream=", (uint32_t)el.Stream,
+            " Usage=", (uint32_t)el.Usage, " UsageIdx=", (uint32_t)el.UsageIndex,
+            " Type=", (uint32_t)el.Type, " Offset=", (uint32_t)el.Offset));
+        }
+      }
+    }
 
     // Process vertex buffers from CPU
     for (const auto& element : d3d9State().vertexDecl->GetElements()) {
@@ -309,10 +346,168 @@ namespace dxvk {
 
     transformData.worldToView = d3d9State().transforms[GetTransformIndex(D3DTS_VIEW)];
     transformData.viewToProjection = d3d9State().transforms[GetTransformIndex(D3DTS_PROJECTION)];
+
+    // For games that use programmable VS and pass camera matrices through shader constants
+    // instead of the fixed-function D3DTS_VIEW/D3DTS_PROJECTION pipeline.
+    if (cameraFromShaderConstants() && m_parent->UseProgrammableVS()) {
+      auto buildMatrixFromConsts = [&](int startReg) -> Matrix4 {
+        const auto& consts = d3d9State().vsConsts.fConsts;
+        return Matrix4(
+          Vector4(consts[startReg + 0].data[0], consts[startReg + 0].data[1], consts[startReg + 0].data[2], consts[startReg + 0].data[3]),
+          Vector4(consts[startReg + 1].data[0], consts[startReg + 1].data[1], consts[startReg + 1].data[2], consts[startReg + 1].data[3]),
+          Vector4(consts[startReg + 2].data[0], consts[startReg + 2].data[1], consts[startReg + 2].data[2], consts[startReg + 2].data[3]),
+          Vector4(consts[startReg + 3].data[0], consts[startReg + 3].data[1], consts[startReg + 3].data[2], consts[startReg + 3].data[3])
+        );
+      };
+
+      const int viewProjReg = cameraViewProjRegister();
+      const int viewReg = cameraViewRegister();
+      const int worldReg = cameraWorldRegister();
+
+      if (viewProjReg >= 0) {
+        Matrix4 viewProj = buildMatrixFromConsts(viewProjReg);
+        const bool zWriteEnabled = d3d9State().renderStates[D3DRS_ZWRITEENABLE];
+        const bool zTestEnabled = d3d9State().renderStates[D3DRS_ZENABLE] != D3DZB_FALSE;
+        const bool alphaBlend = d3d9State().renderStates[D3DRS_ALPHABLENDENABLE];
+
+        // Per-frame draw call counter for logging
+        m_shaderCamDebugDrawCount++;
+
+        // Log every draw call's constants for the first few frames
+        {
+          static uint32_t debugFrameCount = 0;
+          static uint32_t lastFrameId = UINT32_MAX;
+          uint32_t curFrame = m_drawCallID;
+
+          // Use m_cameraFromConstsSetThisFrame as a proxy for "first draw this frame"
+          if (!m_cameraFromConstsSetThisFrame && debugFrameCount < 5) {
+            debugFrameCount++;
+          }
+
+          if (debugFrameCount <= 5 && m_shaderCamDebugDrawCount <= 30) {
+            Logger::info(str::format("[RTX-Cam-DC] frame=", debugFrameCount, " dc=", m_shaderCamDebugDrawCount,
+              " zWrite=", zWriteEnabled ? 1 : 0, " zTest=", zTestEnabled ? 1 : 0, " alphaBlend=", alphaBlend ? 1 : 0,
+              " vp[0][0]=", viewProj[0][0], " vp[1][1]=", viewProj[1][1],
+              " vp[2][3]=", viewProj[2][3], " vp[3][3]=", viewProj[3][3],
+              " vp[3][2]=", viewProj[3][2],
+              " isIdent=", isIdentityExact(viewProj) ? 1 : 0,
+              " det=", determinant(viewProj)));
+          }
+        }
+
+        // Skip if the viewProj matrix is all zeros (constants not yet set)
+        if (!isIdentityExact(viewProj) && std::abs(determinant(viewProj)) > 1e-10) {
+          if (viewReg >= 0) {
+            Matrix4 view = buildMatrixFromConsts(viewReg);
+            double viewDet = determinant(view);
+
+            if (std::abs(viewDet) > 1e-10) {
+              // Game stores column-major matrices in shader registers.
+              // When read as rows, the custom * operator reverses the order.
+              // Derive projection: proj = viewProj * inverse(view)
+              Matrix4 viewInv = inverse(view);
+              Matrix4 proj = viewProj * viewInv;
+
+              // A valid perspective projection must have [3][3] ≈ 0 and [2][3] = ±1
+              bool validPerspective = std::abs(proj[3][3]) < 0.01f &&
+                                     (std::abs(proj[2][3] - 1.0f) < 0.01f || std::abs(proj[2][3] + 1.0f) < 0.01f);
+
+              // Compute FOV for logging
+              float vFov = 2.0f * std::atan(1.0f / std::abs(proj[1][1])) * (180.0f / 3.14159265f);
+              float hFov = 2.0f * std::atan(1.0f / std::abs(proj[0][0])) * (180.0f / 3.14159265f);
+              float aspect = std::abs(proj[1][1]) > 0.001f ? std::abs(proj[0][0] / proj[1][1]) : 0.0f;
+              // aspect is inverted because proj[0][0] < proj[1][1] for wide screens
+              float aspectRatio = std::abs(proj[1][1]) > 0.001f ? std::abs(proj[1][1] / proj[0][0]) : 0.0f;
+              float nearPlane = std::abs(proj[2][2]) > 0.001f ? std::abs(proj[3][2] / proj[2][2]) : 0.0f;
+
+              // Log on camera set and whenever projection changes
+              {
+                static float lastProjDiag0 = 0.0f;
+                static float lastProjDiag1 = 0.0f;
+                bool projChanged = std::abs(proj[0][0] - lastProjDiag0) > 0.001f ||
+                                   std::abs(proj[1][1] - lastProjDiag1) > 0.001f;
+
+                if (!m_cameraFromConstsSetThisFrame || projChanged) {
+                  Logger::info(str::format("[RTX-Cam-Proj] ",
+                    m_cameraFromConstsSetThisFrame ? "CHANGE" : "SET",
+                    " validPersp=", validPerspective ? 1 : 0,
+                    " zWrite=", zWriteEnabled ? 1 : 0,
+                    " proj[0][0]=", proj[0][0], " proj[1][1]=", proj[1][1],
+                    " proj[2][2]=", proj[2][2], " proj[2][3]=", proj[2][3],
+                    " proj[3][2]=", proj[3][2], " proj[3][3]=", proj[3][3],
+                    " vFov=", vFov, "deg hFov=", hFov, "deg aspect=", aspectRatio,
+                    " near=", nearPlane,
+                    " view[3]=[", view[3][0], ",", view[3][1], ",", view[3][2], ",", view[3][3], "]"));
+
+                  if (projChanged) {
+                    lastProjDiag0 = proj[0][0];
+                    lastProjDiag1 = proj[1][1];
+                  }
+                }
+              }
+
+              if (validPerspective) {
+                // Heuristic: zWrite=1 + zTest=0 is a compositing/depth-clear pass (fullscreen quad).
+                // zWrite=0 + zTest=0 is UI/overlay. Both should be skipped from raytracing entirely.
+                // Without this, their identity transforms place fullscreen quad geometry near camera origin.
+                const bool isCompositingOrUI = !zTestEnabled;
+
+                if (isCompositingOrUI) {
+                  ONCE(Logger::info("[RTX-Cam] Skipping compositing/UI draw (zTest=0) from raytracing."));
+                  return false;
+                }
+
+                // Set external camera from z-write+z-test draws (actual 3D scene geometry).
+                // Update every frame to track camera movement.
+                if (zWriteEnabled) {
+                  if (!m_cameraFromConstsSetThisFrame) {
+                    Logger::info(str::format("[RTX-Cam-ExtCam] Setting external camera: vFov=", vFov,
+                      "deg hFov=", hFov, "deg aspect=", aspectRatio, " near=", nearPlane,
+                      " view:\n",
+                      "  [", view[0][0], ", ", view[0][1], ", ", view[0][2], ", ", view[0][3], "]\n",
+                      "  [", view[1][0], ", ", view[1][1], ", ", view[1][2], ", ", view[1][3], "]\n",
+                      "  [", view[2][0], ", ", view[2][1], ", ", view[2][2], ", ", view[2][3], "]\n",
+                      "  [", view[3][0], ", ", view[3][1], ", ", view[3][2], ", ", view[3][3], "]"));
+                  }
+                  m_cameraFromConstsSetThisFrame = true;
+                  m_parent->EmitCs([cView = view, cProj = proj](DxvkContext* ctx) {
+                    static_cast<RtxContext*>(ctx)->getSceneManager().getCameraManager()
+                      .processExternalCamera(CameraType::Main, cView, cProj);
+                  });
+                }
+
+                // Set per-draw-call transforms for all 3D draws.
+                // At this point zTest is guaranteed enabled (compositing/UI returned early above).
+                transformData.worldToView = view;
+                transformData.viewToProjection = proj;
+              }
+            }
+          } else {
+            // Only viewProj available - use it as-is with identity view
+            if (zWriteEnabled && zTestEnabled) {
+              m_cameraFromConstsSetThisFrame = true;
+              m_parent->EmitCs([cViewProj = viewProj](DxvkContext* ctx) {
+                static_cast<RtxContext*>(ctx)->getSceneManager().getCameraManager()
+                  .processExternalCamera(CameraType::Main, Matrix4(), cViewProj);
+              });
+            }
+            if (zTestEnabled) {
+              transformData.worldToView = Matrix4();
+              transformData.viewToProjection = viewProj;
+            }
+          }
+        }
+      }
+
+      if (worldReg >= 0) {
+        transformData.objectToWorld = buildMatrixFromConsts(worldReg);
+      }
+    }
+
     transformData.objectToView = transformData.worldToView * transformData.objectToWorld;
 
     // Some games pass invalid matrices which D3D9 apparently doesnt care about.
-    // since we'll be doing inversions and other matrix operations, we need to 
+    // since we'll be doing inversions and other matrix operations, we need to
     // sanitize those or there be nans.
     transformData.sanitize();
 
@@ -671,7 +866,74 @@ namespace dxvk {
     if (m_activeDrawCallState.usesPixelShader) {
       m_activeDrawCallState.programmablePixelShaderInfo = d3d9State().pixelShader->GetCommonShader()->GetInfo();
     }
-    
+
+    // --- Texture/Shader Debug Capture ---
+    if (g_texShaderDebug.enabled && !g_texShaderDebug.freezeFrame) {
+      TexShaderDebugSnapshot snap;
+      snap.drawcallIndex = g_texShaderDebug.dcCounter;
+      snap.usesVS = m_activeDrawCallState.usesVertexShader;
+      snap.usesPS = m_activeDrawCallState.usesPixelShader;
+      snap.isIndexed = drawContext.Indexed;
+      snap.primCount = drawContext.PrimitiveCount;
+      snap.vertCount = geoData.vertexCount;
+
+      for (uint32_t i = 0; i < 4 && i < caps::TextureStageCount; i++) {
+        IDirect3DBaseTexture9* tex = d3d9State().textures[i];
+        if (tex) {
+          snap.texPtrs[i] = reinterpret_cast<uintptr_t>(tex);
+          snap.texIsRT[i] = isTextureRT(tex);
+
+          D3D9CommonTexture* commonTex = GetCommonTexture(tex);
+          if (commonTex) {
+            auto img = commonTex->GetImage();
+            if (img != nullptr) {
+              snap.texHashes[i] = img->getDescriptorHash();
+              auto extent = img->info().extent;
+              snap.texWidths[i] = extent.width;
+              snap.texHeights[i] = extent.height;
+            }
+          }
+        }
+      }
+
+      // Track texture changes on stage 0
+      if (g_texShaderDebug.trackChanges && snap.texPtrs[0] != 0) {
+        auto prevIt = g_texShaderDebug.prevFrameTex0.find(snap.drawcallIndex);
+        if (prevIt != g_texShaderDebug.prevFrameTex0.end() && prevIt->second != snap.texPtrs[0]) {
+          TexShaderDebugTexChange rec;
+          rec.dcIndex = snap.drawcallIndex;
+          rec.prevTexPtr = prevIt->second;
+          rec.newTexPtr = snap.texPtrs[0];
+          auto hashIt = g_texShaderDebug.prevFrameTex0Hash.find(snap.drawcallIndex);
+          rec.prevHash = (hashIt != g_texShaderDebug.prevFrameTex0Hash.end()) ? hashIt->second : 0;
+          rec.newHash = snap.texHashes[0];
+          rec.frameDetected = g_texShaderDebug.frameNumber;
+          g_texShaderDebug.recentChanges.push_back(rec);
+        }
+        g_texShaderDebug.prevFrameTex0[snap.drawcallIndex] = snap.texPtrs[0];
+        g_texShaderDebug.prevFrameTex0Hash[snap.drawcallIndex] = snap.texHashes[0];
+      }
+
+      if (g_texShaderDebug.logToConsole) {
+        bool shouldLog = (g_texShaderDebug.filterDC < 0 || snap.drawcallIndex == (uint32_t)g_texShaderDebug.filterDC);
+        if (shouldLog) {
+          Logger::info(str::format("[TexDbg DC#", snap.drawcallIndex,
+            "] VS=", snap.usesVS ? 1 : 0, " PS=", snap.usesPS ? 1 : 0,
+            " prims=", snap.primCount, " verts=", snap.vertCount,
+            " tex0=", snap.texPtrs[0], " hash0=", snap.texHashes[0],
+            " ", snap.texWidths[0], "x", snap.texHeights[0],
+            snap.texIsRT[0] ? " **RT**" : "",
+            snap.texPtrs[1] ? str::format(" tex1=", snap.texPtrs[1], " hash1=", snap.texHashes[1]) : std::string("")));
+        }
+      }
+
+      if (g_texShaderDebug.snapshots.size() < TexShaderDebugState::kMaxSnapshots) {
+        g_texShaderDebug.snapshots.push_back(snap);
+      }
+    }
+    g_texShaderDebug.dcCounter++;
+    // --- End Texture/Shader Debug ---
+
     m_activeDrawCallState.cameraType = CameraType::Unknown;
 
     m_activeDrawCallState.minZ = std::clamp(d3d9State().viewport.MinZ, 0.0f, 1.0f);
@@ -1010,8 +1272,84 @@ namespace dxvk {
 
     // Find the ideal textures for raytracing, initialize the data to invalid (out of range) to unbind unused textures
     uint32_t firstStage = 0;
+    const int texStageOffset = (!FixedFunction && forceTextureStage() >= 0) ? forceTextureStage() : 0;
+
+    // TEXTURE STAGE REPLACEMENT: TT Games engine uses stage 0 for lightmap, NOT diffuse.
+    // We need to find the real diffuse at a higher stage and use it instead of stage 0.
+    int recommendedAlbedoSampler = -1;
+
+    // Periodic stage dump: log all DCs for one frame every 3 seconds
+    {
+      static auto s_lastDump = std::chrono::steady_clock::now();
+      static bool s_dumping = false;
+      static int s_prevDC = -1;
+      auto now = std::chrono::steady_clock::now();
+      if (!s_dumping && std::chrono::duration_cast<std::chrono::seconds>(now - s_lastDump).count() >= 3) {
+        s_dumping = true;
+      }
+      if (s_dumping && m_drawCallID <= s_prevDC) {
+        // Frame wrapped, stop dumping
+        s_dumping = false;
+        s_lastDump = now;
+      }
+      s_prevDC = m_drawCallID;
+      if (s_dumping) {
+        std::string stages;
+        for (int s = 0; s < 16; s++) {
+          if (d3d9State().textures[s] != nullptr) {
+            D3D9CommonTexture* t = GetCommonTexture(d3d9State().textures[s]);
+            if (t) {
+              stages += str::format(" s", s, "=", t->Desc()->Width, "x", t->Desc()->Height);
+            }
+          }
+        }
+        Logger::info(str::format("[RTX-StageDump] DC#", m_drawCallID,
+          (FixedFunction ? " [FF]" : " [PS]"),
+          stages.empty() ? " (no tex)" : stages));
+      }
+    }
+    if constexpr (!FixedFunction) {
+      if (forceTextureStage() < 0) {
+        // TT Games engine: stage 0 = lightmap, stage 5 = diffuse.
+        // Scan candidate slots for the real diffuse texture.
+        const int candidateSlots[] = {5, 6, 7, 8, 9, 10, 11, 12};
+        for (int slot : candidateSlots) {
+          if (d3d9State().textures[slot] == nullptr)
+            continue;
+          D3D9CommonTexture* tex = GetCommonTexture(d3d9State().textures[slot]);
+          if (tex == nullptr || (tex->GetType() != D3DRTYPE_TEXTURE && tex->GetType() != D3DRTYPE_CUBETEXTURE))
+            continue;
+          const auto* descC = tex->Desc();
+          if (descC->Width <= 1 && descC->Height <= 1)
+            continue;
+          if (tex->IsRenderTarget() || tex->IsDepthStencil())
+            continue;
+
+          recommendedAlbedoSampler = slot;
+          if (m_drawCallID < 50) {
+            Logger::info(str::format("[RTX-RTReplace] DC#", m_drawCallID,
+              " -> using slot ", slot, " (", descC->Width, "x", descC->Height, ")"));
+          }
+          break;
+        }
+      }
+    }
+
     for (uint32_t idx = 0, textureID = 0; idx < NumTexcoordBins && textureID < LegacyMaterialData::kMaxSupportedTextures; idx++) {
-      const uint8_t stage = FixedFunction ? texcoordIndexToStage[idx] : textureID;
+      uint8_t stage;
+      if (FixedFunction) {
+        stage = texcoordIndexToStage[idx];
+      } else {
+        // Use recommended albedo sampler for first texture if render target was detected at stage 0
+        if (textureID == 0 && recommendedAlbedoSampler >= 0) {
+          stage = (uint8_t)recommendedAlbedoSampler;
+        } else {
+          stage = (uint8_t)(idx + texStageOffset);
+          // Skip the slot already used as albedo replacement
+          if (recommendedAlbedoSampler >= 0 && stage == (uint8_t)recommendedAlbedoSampler)
+            continue;
+        }
+      }
       if (stage == kInvalidStage || d3d9State().textures[stage] == nullptr)
         continue;
 
@@ -1020,16 +1358,13 @@ namespace dxvk {
 
       // Send the texture stage state for first texture slot (or 0th stage if no texture)
       if (textureID == 0) {
-        // ColorTexture2 is optional and currently only used as RayPortal material, the material type will be checked in the submitDrawState.
-        // So we don't use it to check valid drawcall or not here.
         if (pTexInfo->GetImage()->getHash() == kEmptyHash) {
           ONCE(Logger::info("[RTX-Compatibility-Info] Texture 0 without valid hash detected, skipping drawcall."));
           return false;
         }
 
-        if (FixedFunction) {
-          firstStage = stage;
-        }
+        // Track which stage was actually selected as the primary texture
+        firstStage = stage;
       }
 
       D3D9SamplerKey key = m_parent->CreateSamplerKey(stage);
@@ -1052,6 +1387,14 @@ namespace dxvk {
 
       auto shaderSampler = RemapStateSamplerShader(stage);
       m_activeDrawCallState.materialData.colorTextureSlot[textureID] = computeResourceSlotId(shaderSampler.first, DxsoBindingType::Image, uint32_t(shaderSampler.second));
+
+      if (!FixedFunction && m_drawCallID < 50) {
+        const auto imgHash = pTexInfo->GetSampleView(srgb)->image()->getHash();
+        Logger::info(str::format("[RTX-TexBind] DC#", m_drawCallID,
+          " texID=", textureID, " fromStage=", (uint32_t)stage,
+          " ", pTexInfo->Desc()->Width, "x", pTexInfo->Desc()->Height,
+          " imgHash=0x", std::hex, imgHash, std::dec));
+      }
 
       ++textureID;
     }
@@ -1102,7 +1445,29 @@ namespace dxvk {
       }
     }
 
-    m_texcoordIndex = d3d9State().textureStages[firstStage][DXVK_TSS_TEXCOORDINDEX];
+    if (forceTexcoordIndex() >= 0) {
+      m_texcoordIndex = forceTexcoordIndex();
+    } else {
+      m_texcoordIndex = d3d9State().textureStages[firstStage][DXVK_TSS_TEXCOORDINDEX];
+    }
+
+    // Log texture selection details — show all stages so user can identify RT hashes
+    if (!FixedFunction && m_drawCallID < 50) {
+      Logger::info(str::format("[RTX-TexSelect] DC#", m_drawCallID,
+        " firstStage=", firstStage,
+        " texcoordIndex=", m_texcoordIndex,
+        " albedoSlot=", recommendedAlbedoSampler));
+      for (uint32_t s = 0; s < caps::MaxSimultaneousTextures; s++) {
+        if (d3d9State().textures[s] != nullptr) {
+          D3D9CommonTexture* ct = GetCommonTexture(d3d9State().textures[s]);
+          Logger::info(str::format("[RTX-TexStages] DC#", m_drawCallID,
+            " stage=", s,
+            " ", ct->Desc()->Width, "x", ct->Desc()->Height,
+            " hash=0x", std::hex, ct->GetImage()->getHash(), std::dec,
+            " descHash=0x", std::hex, ct->GetImage()->getDescriptorHash(), std::dec));
+        }
+      }
+    }
 
     return true;
   }
@@ -1227,7 +1592,10 @@ namespace dxvk {
     });
 
     // Reset for the next frame
+    g_texShaderDebug.onFrameBegin();
     m_rtxInjectTriggered = false;
+    m_cameraFromConstsSetThisFrame = false;
+    m_shaderCamDebugDrawCount = 0;
     m_drawCallID = 0;
     m_seenCameraPositionsPrev = std::move(m_seenCameraPositions);
 

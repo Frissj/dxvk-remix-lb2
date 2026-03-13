@@ -182,6 +182,9 @@ namespace dxvk {
     friend class RtxInitializer;
     friend class RtxComposite;
 
+    RTX_OPTION("rtx", fast_unordered_set, renderTargetReplacementTextures, {},
+                  "Descriptor hashes for render target textures that should be replaced when bound at stage 0.\n"
+                  "When a texture matching this list is found at stage 0, the system searches candidate slots (5,6,7,8,15,3,2,1) for a real diffuse texture to use instead.");
     RTX_OPTION("rtx", fast_unordered_set, lightmapTextures, {},
                   "Textures used for lightmapping (baked static lighting on surfaces) in older games.\n"
                   "These textures will be ignored when attempting to determine the desired textures from a draw to use for ray tracing.");

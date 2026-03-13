@@ -42,13 +42,45 @@ namespace interleaver {
 
     // Passthrough format mapping
     VK_FORMAT_B8G8R8A8_UNORM = 44,
+    VK_FORMAT_R16G16_SFLOAT = 83,
+    VK_FORMAT_R16G16B16A16_SFLOAT = 97,
     VK_FORMAT_R32G32_SFLOAT = 103,
     VK_FORMAT_R32G32B32_SFLOAT = 106,
     VK_FORMAT_R32G32B32A32_SFLOAT = 109,
   };
 
+#ifdef __cplusplus
+  static float halfToFloat(uint32_t h) {
+    uint32_t sign = (h & 0x8000u) << 16;
+    uint32_t exponent = (h >> 10) & 0x1Fu;
+    uint32_t mantissa = h & 0x3FFu;
+    uint32_t result;
+    if (exponent == 0) {
+      if (mantissa == 0) {
+        result = sign;
+      } else {
+        exponent = 1;
+        while (!(mantissa & 0x400u)) { mantissa <<= 1; exponent--; }
+        mantissa &= 0x3FFu;
+        result = sign | ((exponent + 127 - 15) << 23) | (mantissa << 13);
+      }
+    } else if (exponent == 31) {
+      result = sign | 0x7F800000u | (mantissa << 13);
+    } else {
+      result = sign | ((exponent + 127 - 15) << 23) | (mantissa << 13);
+    }
+    return *reinterpret_cast<const float*>(&result);
+  }
+#else
+  float halfToFloat(uint h) {
+    return f16tof32(h);
+  }
+#endif
+
   bool formatConversionFloatSupported(uint32_t format) {
     switch (format) {
+    case SupportedVkFormats::VK_FORMAT_R16G16_SFLOAT:
+    case SupportedVkFormats::VK_FORMAT_R16G16B16A16_SFLOAT:
     case SupportedVkFormats::VK_FORMAT_R32G32_SFLOAT:
     case SupportedVkFormats::VK_FORMAT_R32G32B32_SFLOAT:
     case SupportedVkFormats::VK_FORMAT_R32G32B32A32_SFLOAT:
@@ -71,6 +103,24 @@ namespace interleaver {
 
   float3 convert(uint32_t format, ReadBuffer(float) input, uint32_t index) {
     switch (format) {
+    case SupportedVkFormats::VK_FORMAT_R16G16_SFLOAT:
+    {
+      // Two half-floats packed in one 32-bit word: [G:16][R:16]
+      uint data = asuint(input[index]);
+      float r = halfToFloat(data & 0xFFFFu);
+      float g = halfToFloat((data >> 16) & 0xFFFFu);
+      return float3(r, g, 0);
+    }
+    case SupportedVkFormats::VK_FORMAT_R16G16B16A16_SFLOAT:
+    {
+      // Four half-floats in two 32-bit words: [G:16][R:16] [A:16][B:16]
+      uint data0 = asuint(input[index]);
+      uint data1 = asuint(input[index + 1]);
+      float r = halfToFloat(data0 & 0xFFFFu);
+      float g = halfToFloat((data0 >> 16) & 0xFFFFu);
+      float b = halfToFloat(data1 & 0xFFFFu);
+      return float3(r, g, b);
+    }
     case SupportedVkFormats::VK_FORMAT_R32G32_SFLOAT:
       return float3(input[index + 0], input[index + 1], 0);
     case SupportedVkFormats::VK_FORMAT_R32G32B32_SFLOAT:

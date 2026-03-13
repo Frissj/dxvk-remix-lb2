@@ -74,6 +74,8 @@
 
 
 namespace dxvk {
+  // Definition of the global texture/shader debug state (declared extern in d3d9_rtx.h)
+  TexShaderDebugState g_texShaderDebug;
   extern size_t g_streamedTextures_budgetBytes;
   extern size_t g_streamedTextures_usedBytes;
 }
@@ -179,6 +181,7 @@ namespace dxvk {
     {"ignoretextures", "Ignore Texture (optional)", &RtxOptions::ignoreTexturesObject()},
     {"hidetextures", "Hide Texture Instance (optional)", &RtxOptions::hideInstanceTexturesObject()},
     {"lightmaptextures","Lightmap Textures (optional)", &RtxOptions::lightmapTexturesObject()},
+    {"rendertargetreplacementtextures","Render Target Replacement Textures (optional)", &RtxOptions::renderTargetReplacementTexturesObject()},
     {"ignorelights", "Ignore Lights (optional)", &RtxOptions::ignoreLightsObject()},
     {"particletextures", "Particle Texture (optional)", &RtxOptions::particleTexturesObject()},
     {"beamtextures", "Beam Texture (optional)", &RtxOptions::beamTexturesObject()},
@@ -1932,6 +1935,73 @@ namespace dxvk {
       }
 
       ImGui::Unindent();
+    }
+
+    RemixGui::Separator();
+    if (ImGui::CollapsingHeader("Texture / Shader Debug")) {
+      auto& dbg = g_texShaderDebug;
+      ImGui::Checkbox("Enable Tex/Shader Debug", &dbg.enabled);
+      if (dbg.enabled) {
+        ImGui::SameLine();
+        ImGui::Checkbox("Log Console", &dbg.logToConsole);
+        ImGui::Checkbox("Freeze Frame", &dbg.freezeFrame);
+        ImGui::SameLine();
+        ImGui::Checkbox("Track Tex Changes", &dbg.trackChanges);
+
+        ImGui::Text("Frame: %u | DCs captured: %u", dbg.frameNumber, (uint32_t)dbg.snapshots.size());
+        ImGui::SliderInt("Filter DC (-1=all)", &dbg.filterDC, -1, 2000);
+
+        ImGui::Separator();
+
+        // Show texture change alerts
+        if (dbg.trackChanges && !dbg.recentChanges.empty()) {
+          ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
+          ImGui::Text("=== TEXTURE CHANGES (%u) ===", (uint32_t)dbg.recentChanges.size());
+          ImGui::PopStyleColor();
+          for (auto& rec : dbg.recentChanges) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.6f, 0.2f, 1.0f));
+            ImGui::Text("  DC#%u tex0: 0x%llX(h=%llX) -> 0x%llX(h=%llX) @frame %u",
+              rec.dcIndex, (unsigned long long)rec.prevTexPtr, (unsigned long long)rec.prevHash,
+              (unsigned long long)rec.newTexPtr, (unsigned long long)rec.newHash, rec.frameDetected);
+            ImGui::PopStyleColor();
+          }
+          ImGui::Separator();
+        }
+
+        // Scrollable drawcall list
+        if (ImGui::BeginChild("##texdbg_dc_list", ImVec2(0, 400), true)) {
+          for (auto& snap : dbg.snapshots) {
+            if (dbg.filterDC >= 0 && snap.drawcallIndex != (uint32_t)dbg.filterDC)
+              continue;
+
+            bool hasRT = snap.texIsRT[0];
+            if (hasRT) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
+
+            char label[256];
+            snprintf(label, sizeof(label), "DC#%u %s VS=%d PS=%d p=%u v=%u t0=0x%llX(%ux%u)%s",
+              snap.drawcallIndex, snap.isIndexed ? "IDX" : "PRM",
+              snap.usesVS ? 1 : 0, snap.usesPS ? 1 : 0,
+              snap.primCount, snap.vertCount,
+              (unsigned long long)snap.texPtrs[0], snap.texWidths[0], snap.texHeights[0],
+              hasRT ? " [RT!]" : "");
+
+            if (ImGui::TreeNode(label)) {
+              for (int s = 0; s < 4; s++) {
+                if (snap.texPtrs[s]) {
+                  ImGui::Text("  Stage %d: ptr=0x%llX hash=0x%llX %ux%u%s",
+                    s, (unsigned long long)snap.texPtrs[s], (unsigned long long)snap.texHashes[s],
+                    snap.texWidths[s], snap.texHeights[s],
+                    snap.texIsRT[s] ? " **RT**" : "");
+                }
+              }
+              ImGui::TreePop();
+            }
+
+            if (hasRT) ImGui::PopStyleColor();
+          }
+        }
+        ImGui::EndChild();
+      }
     }
 
     ImGui::PopItemWidth();

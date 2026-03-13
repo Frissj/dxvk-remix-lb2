@@ -11,6 +11,64 @@ namespace dxvk {
   struct D3D9BufferSlice;
   class DxvkDevice;
 
+  // ========================================================
+  // Texture/Shader Debug System (shared between d3d9 and dxvk imgui)
+  // ========================================================
+  struct TexShaderDebugSnapshot {
+    uint32_t drawcallIndex = 0;
+    uintptr_t texPtrs[4] = {};
+    XXH64_hash_t texHashes[4] = {};
+    uint32_t texWidths[4] = {};
+    uint32_t texHeights[4] = {};
+    bool texIsRT[4] = {};
+    bool usesVS = false;
+    bool usesPS = false;
+    uint32_t primCount = 0;
+    uint32_t vertCount = 0;
+    bool isIndexed = false;
+  };
+
+  struct TexShaderDebugTexChange {
+    uint32_t dcIndex = 0;
+    uintptr_t prevTexPtr = 0;
+    uintptr_t newTexPtr = 0;
+    XXH64_hash_t prevHash = 0;
+    XXH64_hash_t newHash = 0;
+    uint32_t frameDetected = 0;
+  };
+
+  struct TexShaderDebugState {
+    static constexpr uint32_t kMaxSnapshots = 4096;
+
+    bool enabled = false;
+    bool logToConsole = false;
+    bool trackChanges = false;
+    bool freezeFrame = false;
+    int filterDC = -1;
+
+    uint32_t frameNumber = 0;
+    uint32_t dcCounter = 0;
+
+    std::vector<TexShaderDebugSnapshot> snapshots;
+    std::vector<TexShaderDebugTexChange> recentChanges;
+
+    std::unordered_map<uint32_t, uintptr_t> prevFrameTex0;
+    std::unordered_map<uint32_t, XXH64_hash_t> prevFrameTex0Hash;
+
+    void onFrameBegin() {
+      if (!enabled) return;
+      frameNumber++;
+      dcCounter = 0;
+      if (!freezeFrame) {
+        snapshots.clear();
+        recentChanges.clear();
+      }
+    }
+  };
+
+  // Global instance - lives in d3d9_rtx.cpp, accessed from dxvk_imgui.cpp
+  extern TexShaderDebugState g_texShaderDebug;
+
   enum class D3D9RtxFlag : uint32_t {
     DirtyLights,
     DirtyClipPlanes,
@@ -40,6 +98,13 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, useVertexCapture, true, "When enabled, injects code into the original vertex shader to capture final shaded vertex positions.  Is useful for games using simple vertex shaders, that still also set the fixed function transform matrices.");
     RTX_OPTION("rtx", bool, useVertexCapturedNormals, true, "When enabled, vertex normals are read from the input assembler and used in raytracing.  This doesn't always work as normals can be in any coordinate space, but can help sometimes.");
     RTX_OPTION("rtx", bool, useWorldMatricesForShaders, true, "When enabled, Remix will utilize the world matrices being passed from the game via D3D9 fixed function API, even when running with shaders.  Sometimes games pass these matrices and they are useful, however for some games they are very unreliable, and should be filtered out.  If you're seeing precision related issues with shader vertex capture, try disabling this setting.");
+    RTX_OPTION("rtx", bool, cameraFromShaderConstants, false, "When enabled, extracts camera view and projection matrices from vertex shader float constants instead of the D3D9 fixed-function transform pipeline.  Useful for games that use programmable vertex shaders and never call SetTransform for D3DTS_VIEW/D3DTS_PROJECTION.");
+    RTX_OPTION("rtx", int, cameraViewProjRegister, 0, "The starting VS float constant register for the combined view-projection matrix (4 consecutive float4 registers = 4x4 matrix).  Only used when rtx.cameraFromShaderConstants is enabled.");
+    RTX_OPTION("rtx", int, cameraViewRegister, 4, "The starting VS float constant register for the view matrix (4 consecutive float4 registers = 4x4 matrix).  Only used when rtx.cameraFromShaderConstants is enabled.  Set to -1 to derive view from viewProj using a default projection.");
+    RTX_OPTION("rtx", int, cameraWorldRegister, -1, "The starting VS float constant register for the world/object matrix (4 consecutive float4 registers = 4x4 matrix).  Only used when rtx.cameraFromShaderConstants is enabled.  Set to -1 to use identity.");
+    RTX_OPTION("rtx", bool, forceInputTexcoords, false, "When enabled, always uses texture coordinates from the input vertex declaration instead of vertex shader output.  Fixes sliding UVs in games where vertex shaders compute view-dependent texcoords (e.g. screen-space projected UVs for render target sampling).");
+    RTX_OPTION("rtx", int, forceTexcoordIndex, -1, "Forces which TEXCOORD index to read from the input vertex declaration.  Set to -1 for auto (uses the texture stage state).  Only used when rtx.forceInputTexcoords is enabled.");
+    RTX_OPTION("rtx", int, forceTextureStage, -1, "Forces which D3D9 texture stage to use as the primary texture for raytracing.  Set to -1 for auto.  Useful when stage 0 contains a render target texture and the actual diffuse texture is at a higher stage.");
     RTX_OPTION("rtx", bool, enableIndexBufferMemoization, true, "CPU performance optimization, should generally be enabled.  Will reduce main thread time by caching processIndexBuffer operations and reusing when possible, this will come at the expense of some CPU RAM.");
     RTX_OPTION("rtx", uint32_t, numGeometryProcessingThreads, 2, "The desired number of CPU threads to dedicate to geometry processing  Will be limited by the number of CPU cores.  There may be some advantage to lowering this number in games which are fairly simple and use a low number of draw calls per frame.  The default was determined by looking at a game with around 2000 draw calls per frame, and with a reasonably high average triangle count per draw.");
 
@@ -198,6 +263,8 @@ namespace dxvk {
 
     const bool m_enableDrawCallConversion;
     bool m_rtxInjectTriggered = false;
+    bool m_cameraFromConstsSetThisFrame = false;
+    uint32_t m_shaderCamDebugDrawCount = 0;
     bool m_forceGeometryCopy = false;
     DWORD m_texcoordIndex = 0;
 
