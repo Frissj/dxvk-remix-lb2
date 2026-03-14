@@ -76,11 +76,62 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
   }
   opaqueMat.setIgnoreAlphaChannel(ignoreAlphaChannel);
 
-  // Pink fallback for meshes without a valid texture
-  if (!usesTexture()) {
-    opaqueMat.setAlbedoConstant(Vector3(1.0f, 0.0f, 1.0f));
-    opaqueMat.setOpacityConstant(1.0f);
+  // TT Games engine extra maps: normal map from stage 6
+  if (getNormalMapTexture().isValid()) {
+    opaqueMat.setNormalTexture(getNormalMapTexture());
   }
+
+  // TT Games engine: roughness from PS constant c20.x (kBRDFRoughness)
+  // -0.1 = sentinel meaning "not set", positive values = actual roughness
+  if (ttRoughnessConstant > 0.0f) {
+    opaqueMat.setRoughnessConstant(ttRoughnessConstant);
+  }
+
+  // TT Games engine: emissive for additive blend draws (SRCALPHA + ONE)
+  // These are glow passes where the texture IS the emissive color.
+  // The glow texture at stage 5 becomes both albedo and emissive color source.
+  if (ttIsAdditiveBlend) {
+    opaqueMat.setEnableEmission(true);
+    opaqueMat.setEmissiveIntensity(ttGlowIntensity > 0.0f ? ttGlowIntensity : 1.0f);
+    opaqueMat.setEmissiveColorConstant(Vector3(1.0f, 1.0f, 1.0f));
+    // Use the albedo texture as the emissive color texture
+    if (getColorTexture().isValid()) {
+      opaqueMat.setEmissiveColorTexture(getColorTexture());
+    }
+    static uint32_t s_emMatLog = 0;
+    if (s_emMatLog < 10) {
+      s_emMatLog++;
+      Logger::info(str::format("[RTX-EmMat] ttIsAdditiveBlend=1",
+        " colorTex=", getColorTexture().isValid() ? "valid" : "INVALID",
+        " colorTexEmpty=", getColorTexture().isImageEmpty() ? "YES" : "no",
+        " hash=0x", std::hex, getHash(), std::dec,
+        " glowI=", ttGlowIntensity,
+        " albedo=", opaqueMat.getAlbedoOpacityTexture().isValid() ? "valid" : "INVALID",
+        " emTex=", opaqueMat.getEmissiveColorTexture().isValid() ? "valid" : "INVALID",
+        " emI=", opaqueMat.getEmissiveIntensity(),
+        " emEn=", opaqueMat.getEnableEmission() ? 1 : 0));
+    }
+  }
+
+  // NV-DXVK start: apply extracted PBR material properties from shader constants (ubershader emulation)
+  if (hasExtractedPBR) {
+    opaqueMat.setAlbedoConstant(extractedAlbedoColor);
+    opaqueMat.setOpacityConstant(extractedOpacity);
+    if (extractedMetallic >= 0.0f)
+      opaqueMat.setMetallicConstant(extractedMetallic);
+    if (extractedEmissiveIntensity > 0.0f && !ttIsAdditiveBlend) {
+      opaqueMat.setEnableEmission(true);
+      opaqueMat.setEmissiveColorConstant(extractedEmissiveColor);
+      opaqueMat.setEmissiveIntensity(extractedEmissiveIntensity);
+    }
+  } else {
+    // Pink fallback for meshes without a valid texture (original behavior)
+    if (!usesTexture()) {
+      opaqueMat.setAlbedoConstant(Vector3(1.0f, 0.0f, 1.0f));
+      opaqueMat.setOpacityConstant(1.0f);
+    }
+  }
+  // NV-DXVK end
 
   return opaqueMat;
 }

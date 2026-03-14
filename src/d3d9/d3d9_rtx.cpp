@@ -836,6 +836,11 @@ namespace dxvk {
       return prepareFlagsForIgnoredDraws;
     }
 
+    // NV-DXVK start: extract material properties from programmable shader constants
+    // Must be after processRenderState() so that textures are loaded and usesTexture() works
+    extractShaderConstantMaterial(m_parent, m_activeDrawCallState.materialData);
+    // NV-DXVK end
+
     // Max offseted index value within a buffer slice that geoData contains
     const uint32_t maxOffsetedIndex = maxIndex - minIndex;
 
@@ -1299,13 +1304,50 @@ namespace dxvk {
           if (d3d9State().textures[s] != nullptr) {
             D3D9CommonTexture* t = GetCommonTexture(d3d9State().textures[s]);
             if (t) {
-              stages += str::format(" s", s, "=", t->Desc()->Width, "x", t->Desc()->Height);
+              const auto h = t->GetImage()->getHash();
+              stages += str::format(" s", s, "=", t->Desc()->Width, "x", t->Desc()->Height,
+                "[", std::hex, h, std::dec, "]");
             }
           }
         }
+        // Log all material PS float constants (c0-c26)
+        // c0=layer0_diffuse c1=layer1_diffuse c2=layer2_diffuse c3=layer3_diffuse
+        // c4=specular_specular c5=specular2_specular c6=specular_params c7=surface_params
+        // c8=surface_params2 c9=incandescentGlow c10=rimLightColour c11=fresnel_params
+        // c12=ambientColor c13=envmap_params c14=diffenv_params c15=refraction_color
+        // c16=refraction_kIndex c17=lego_params c18=vtf_kNormal c19=carpaint_params
+        // c20=brdf_params c21=fractal_params c22-25=carpaint_tints c26=specular3_specular
+        std::string psConsts;
+        if constexpr (!FixedFunction) {
+          psConsts = "\n";
+          const char* names[] = {
+            "layer0_diff", "layer1_diff", "layer2_diff", "layer3_diff",
+            "spec_spec", "spec2_spec", "spec_params", "surf_params",
+            "surf_params2", "glow", "rimLight", "fresnel",
+            "ambient", "envmap", "diffenv", "refract_col",
+            "refract_kIdx", "lego", "vtf_kNorm", "carpaint",
+            "brdf", "fractal", "cp_tint0", "cp_tint1", "cp_tint2", "cp_tint3", "spec3_spec"
+          };
+          for (int r = 0; r < 27; r++) {
+            const auto& c = d3d9State().psConsts.fConsts[r];
+            if (c[0] != 0.0f || c[1] != 0.0f || c[2] != 0.0f || c[3] != 0.0f) {
+              psConsts += str::format("  c", r, "=", names[r], "(", c[0], ",", c[1], ",", c[2], ",", c[3], ")\n");
+            }
+          }
+        }
+        // Add blend state info
+        const bool blendEnable = d3d9State().renderStates[D3DRS_ALPHABLENDENABLE] != 0;
+        const DWORD srcBlend = d3d9State().renderStates[D3DRS_SRCBLEND];
+        const DWORD destBlend = d3d9State().renderStates[D3DRS_DESTBLEND];
+        std::string blendStr;
+        if (blendEnable) {
+          blendStr = str::format(" BLEND(src=", srcBlend, ",dst=", destBlend, ")");
+        }
         Logger::info(str::format("[RTX-StageDump] DC#", m_drawCallID,
           (FixedFunction ? " [FF]" : " [PS]"),
-          stages.empty() ? " (no tex)" : stages));
+          blendStr,
+          stages.empty() ? " (no tex)" : stages,
+          psConsts));
       }
     }
     if constexpr (!FixedFunction) {
@@ -1397,6 +1439,72 @@ namespace dxvk {
       }
 
       ++textureID;
+    }
+
+    // TT Games engine: populate extra material maps from higher texture stages
+    // s6 = normal map, s7 = specular/roughness map
+    if constexpr (!FixedFunction) {
+      auto trySetExtraTexture = [&](int stageIdx, TextureRef& outRef) {
+        if (d3d9State().textures[stageIdx] == nullptr)
+          return;
+        D3D9CommonTexture* tex = GetCommonTexture(d3d9State().textures[stageIdx]);
+        if (tex == nullptr)
+          return;
+        const auto* desc = tex->Desc();
+        // Skip tiny utility textures and render targets
+        if (desc->Width <= 1 && desc->Height <= 1)
+          return;
+        if (tex->IsRenderTarget() || tex->IsDepthStencil())
+          return;
+        // Skip if hash is 0 (blank texture)
+        if (tex->GetImage()->getHash() == 0)
+          return;
+        // Skip if same texture as diffuse (s5) — no separate map
+        if (recommendedAlbedoSampler >= 0 && d3d9State().textures[recommendedAlbedoSampler] != nullptr) {
+          D3D9CommonTexture* diffTex = GetCommonTexture(d3d9State().textures[recommendedAlbedoSampler]);
+          if (diffTex && tex->GetImage()->getHash() == diffTex->GetImage()->getHash())
+            return;
+        }
+        const bool srgb = d3d9State().samplerStates[stageIdx][D3DSAMP_SRGBTEXTURE] & 0x1;
+        outRef = TextureRef(tex->GetSampleView(srgb));
+      };
+
+      trySetExtraTexture(6, m_activeDrawCallState.materialData.normalMapTexture);
+
+      // Read PS float constants for material properties via CTAB lookup
+      // (Previously used hardcoded c6/c9/c20 registers which break across shader variants)
+      // extractShaderConstantMaterial() handles this now via proper CTAB name→register mapping
+
+      // Detect additive blend (SRCALPHA + ONE) = glow/emissive pass
+      const bool blendOn = d3d9State().renderStates[D3DRS_ALPHABLENDENABLE] != 0;
+      const DWORD srcB = d3d9State().renderStates[D3DRS_SRCBLEND];
+      const DWORD dstB = d3d9State().renderStates[D3DRS_DESTBLEND];
+      // D3DBLEND_SRCALPHA=5, D3DBLEND_ONE=2
+      m_activeDrawCallState.materialData.ttIsAdditiveBlend = blendOn && (dstB == D3DBLEND_ONE);
+
+      // Log D3D material + VS constants for emissive draws to find actual glow values
+      if (m_activeDrawCallState.materialData.ttIsAdditiveBlend) {
+        static uint32_t s_emissiveLogCount = 0;
+        if (s_emissiveLogCount < 30) {
+          s_emissiveLogCount++;
+          const auto& mat = d3d9State().material;
+          // Check vertex shader constants too (glow color might be in VS)
+          std::string vsConsts;
+          for (int r = 0; r < 10; r++) {
+            const auto& vc = d3d9State().vsConsts.fConsts[r];
+            if (vc[0] != 0.0f || vc[1] != 0.0f || vc[2] != 0.0f || vc[3] != 0.0f) {
+              vsConsts += str::format(" vs", r, "=(", vc[0], ",", vc[1], ",", vc[2], ",", vc[3], ")");
+            }
+          }
+          // Also check texture factor (D3DRS_TEXTUREFACTOR)
+          const DWORD texFactor = d3d9State().renderStates[D3DRS_TEXTUREFACTOR];
+          Logger::info(str::format("[RTX-Emissive] DC#", m_drawCallID,
+            " D3DMat.Emissive=(", mat.Emissive.r, ",", mat.Emissive.g, ",", mat.Emissive.b, ",", mat.Emissive.a, ")",
+            " D3DMat.Diffuse=(", mat.Diffuse.r, ",", mat.Diffuse.g, ",", mat.Diffuse.b, ",", mat.Diffuse.a, ")",
+            " texFactor=0x", std::hex, texFactor, std::dec,
+            vsConsts.empty() ? "" : vsConsts));
+        }
+      }
     }
 
     // Update the drawcall state with texture stage info

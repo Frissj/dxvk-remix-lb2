@@ -8,6 +8,10 @@
 
 #include "d3d9_rtx_utils.h"
 #include "d3d9_device.h"
+#include "d3d9_shader.h"
+
+#include <algorithm>
+#include <cmath>
 
 #include "../util/util_fastops.h"
 #include "../util/util_math.h"
@@ -243,4 +247,201 @@ namespace dxvk {
       fogState.mode = D3DFOG_NONE;
     }
   }
+
+  // NV-DXVK start: extract material properties from programmable shader constants (ubershader emulation)
+  static int32_t findConstantRegister(const DxsoCtab& ctab, const char* name) {
+    for (const auto& c : ctab.m_constantData) {
+      if (c.name == name)
+        return static_cast<int32_t>(c.registerIndex);
+    }
+    return -1;
+  }
+
+  static uint32_t float4ToD3DCOLOR(const Vector4& v) {
+    uint8_t a = static_cast<uint8_t>(std::clamp(v[3], 0.0f, 1.0f) * 255.0f + 0.5f);
+    uint8_t r = static_cast<uint8_t>(std::clamp(v[0], 0.0f, 1.0f) * 255.0f + 0.5f);
+    uint8_t g = static_cast<uint8_t>(std::clamp(v[1], 0.0f, 1.0f) * 255.0f + 0.5f);
+    uint8_t b = static_cast<uint8_t>(std::clamp(v[2], 0.0f, 1.0f) * 255.0f + 0.5f);
+    return D3DCOLOR_ARGB(a, r, g, b);
+  }
+
+  static Vector4 readPsConstant(const Direct3DState9& d3d9State, const char* name) {
+    if (d3d9State.pixelShader == nullptr)
+      return Vector4(0.0f);
+    const DxsoCtab& ctab = d3d9State.pixelShader->GetCommonShader()->GetCtab();
+    int32_t reg = findConstantRegister(ctab, name);
+    if (reg >= 0 && reg < caps::MaxFloatConstantsPS)
+      return d3d9State.psConsts.fConsts[reg];
+    return Vector4(0.0f);
+  }
+
+  static Vector4 readVsConstant(const Direct3DState9& d3d9State, const char* name) {
+    if (d3d9State.vertexShader == nullptr)
+      return Vector4(0.0f);
+    const DxsoCtab& ctab = d3d9State.vertexShader->GetCommonShader()->GetCtab();
+    int32_t reg = findConstantRegister(ctab, name);
+    if (reg >= 0 && reg < caps::MaxFloatConstantsSoftware)
+      return d3d9State.vsConsts.fConsts[reg];
+    return Vector4(0.0f);
+  }
+
+  static bool isNonZero(const Vector4& v) {
+    return v[0] != 0.0f || v[1] != 0.0f || v[2] != 0.0f || v[3] != 0.0f;
+  }
+
+  static bool isNonWhite(const Vector4& v) {
+    return v[0] != 1.0f || v[1] != 1.0f || v[2] != 1.0f;
+  }
+
+  void extractShaderConstantMaterial(D3D9DeviceEx* pDevice, LegacyMaterialData& materialData) {
+    if (!RtxOptions::enableShaderConstantExtraction())
+      return;
+
+    const Direct3DState9& d3d9State = *pDevice->GetRawState();
+
+    // When using shader constant extraction, the game's ubershader handles lighting -
+    // vertex colors are actual vertex colors, not baked lighting
+    materialData.isVertexColorBakedLighting = false;
+    materialData.hasExtractedPBR = true;
+
+    // === ALBEDO COLOR ===
+    // Primary diffuse from PS constant fs_layer0_diffuse
+    Vector4 diffuseColor = readPsConstant(d3d9State, "fs_layer0_diffuse");
+    // Fallback: VS constant vs_layer0_diffuse
+    if (!isNonZero(diffuseColor))
+      diffuseColor = readVsConstant(d3d9State, "vs_layer0_diffuse");
+    // Default to white if nothing found
+    if (!isNonZero(diffuseColor))
+      diffuseColor = Vector4(1.0f, 1.0f, 1.0f, 1.0f);
+
+    // Multiply by VS tint
+    Vector4 tintColor = readVsConstant(d3d9State, "vs_kTint");
+    if (isNonZero(tintColor)) {
+      diffuseColor[0] *= std::clamp(tintColor[0], 0.0f, 2.0f);
+      diffuseColor[1] *= std::clamp(tintColor[1], 0.0f, 2.0f);
+      diffuseColor[2] *= std::clamp(tintColor[2], 0.0f, 2.0f);
+      diffuseColor[3] *= std::clamp(tintColor[3], 0.0f, 2.0f);
+    }
+
+    // Blend in additional diffuse layers (multi-layer materials)
+    Vector4 layer1 = readPsConstant(d3d9State, "fs_layer1_diffuse");
+    Vector4 layer2 = readPsConstant(d3d9State, "fs_layer2_diffuse");
+    Vector4 layer3 = readPsConstant(d3d9State, "fs_layer3_diffuse");
+    if (isNonZero(layer1)) {
+      float a = std::clamp(layer1[3], 0.0f, 1.0f);
+      diffuseColor[0] = diffuseColor[0] * (1.0f - a) + layer1[0] * a;
+      diffuseColor[1] = diffuseColor[1] * (1.0f - a) + layer1[1] * a;
+      diffuseColor[2] = diffuseColor[2] * (1.0f - a) + layer1[2] * a;
+    }
+    if (isNonZero(layer2)) {
+      float a = std::clamp(layer2[3], 0.0f, 1.0f);
+      diffuseColor[0] = diffuseColor[0] * (1.0f - a) + layer2[0] * a;
+      diffuseColor[1] = diffuseColor[1] * (1.0f - a) + layer2[1] * a;
+      diffuseColor[2] = diffuseColor[2] * (1.0f - a) + layer2[2] * a;
+    }
+    if (isNonZero(layer3)) {
+      float a = std::clamp(layer3[3], 0.0f, 1.0f);
+      diffuseColor[0] = diffuseColor[0] * (1.0f - a) + layer3[0] * a;
+      diffuseColor[1] = diffuseColor[1] * (1.0f - a) + layer3[1] * a;
+      diffuseColor[2] = diffuseColor[2] * (1.0f - a) + layer3[2] * a;
+    }
+
+    // Car paint materials: use dominant tint as albedo
+    Vector4 carpaint0 = readPsConstant(d3d9State, "fs_carpaint_tints0");
+    if (isNonZero(carpaint0)) {
+      diffuseColor[0] *= std::clamp(carpaint0[0], 0.0f, 1.0f);
+      diffuseColor[1] *= std::clamp(carpaint0[1], 0.0f, 1.0f);
+      diffuseColor[2] *= std::clamp(carpaint0[2], 0.0f, 1.0f);
+    }
+
+    // Store final albedo
+    materialData.extractedAlbedoColor = Vector3(
+      std::clamp(diffuseColor[0], 0.0f, 1.0f),
+      std::clamp(diffuseColor[1], 0.0f, 1.0f),
+      std::clamp(diffuseColor[2], 0.0f, 1.0f)
+    );
+    materialData.extractedOpacity = std::clamp(diffuseColor[3], 0.0f, 1.0f);
+
+    // Set tFactor for texture modulation pipeline
+    materialData.tFactor = float4ToD3DCOLOR(Vector4(
+      materialData.extractedAlbedoColor[0],
+      materialData.extractedAlbedoColor[1],
+      materialData.extractedAlbedoColor[2],
+      materialData.extractedOpacity
+    ));
+    if (materialData.usesTexture()) {
+      materialData.textureColorArg1Source = RtTextureArgSource::Texture;
+      materialData.textureColorArg2Source = RtTextureArgSource::TFactor;
+      materialData.textureColorOperation = DxvkRtTextureOperation::Modulate;
+    } else {
+      materialData.textureColorArg1Source = RtTextureArgSource::TFactor;
+      materialData.textureColorOperation = DxvkRtTextureOperation::SelectArg1;
+    }
+    materialData.textureAlphaArg1Source = materialData.usesTexture()
+      ? RtTextureArgSource::Texture : RtTextureArgSource::TFactor;
+    materialData.textureAlphaArg2Source = materialData.usesTexture()
+      ? RtTextureArgSource::TFactor : RtTextureArgSource::None;
+    materialData.textureAlphaOperation = materialData.usesTexture()
+      ? DxvkRtTextureOperation::Modulate : DxvkRtTextureOperation::SelectArg1;
+
+    // === ROUGHNESS ===
+    // Try BRDF roughness first (direct value from kBRDFRoughness)
+    Vector4 brdfParams = readPsConstant(d3d9State, "fs_brdf_params");
+    if (isNonZero(brdfParams) && brdfParams[0] > 0.0f)
+      materialData.extractedRoughness = std::clamp(brdfParams[0], 0.01f, 1.0f);
+    // Fallback: derive from specular cosine power (roughness = sqrt(2/(power+2)))
+    Vector4 specParams = readPsConstant(d3d9State, "fs_specular_params");
+    if (materialData.extractedRoughness < 0.0f && isNonZero(specParams) && specParams[0] > 0.0f) {
+      materialData.extractedSpecularPower = specParams[0];
+      materialData.extractedRoughness = std::clamp(std::sqrt(2.0f / (specParams[0] + 2.0f)), 0.01f, 1.0f);
+    }
+    // Fallback: fs_lego_params.x (engine-specific material roughness)
+    Vector4 legoParams = readPsConstant(d3d9State, "fs_lego_params");
+    if (materialData.extractedRoughness < 0.0f && isNonZero(legoParams))
+      materialData.extractedRoughness = std::clamp(legoParams[0], 0.01f, 1.0f);
+
+    // === METALLIC ===
+    // From fresnel params - kFresnel = reflectance at normal incidence → metallic
+    Vector4 fresnelParams = readPsConstant(d3d9State, "fs_fresnel_params");
+    if (isNonZero(fresnelParams))
+      materialData.extractedMetallic = std::clamp(fresnelParams[0], 0.0f, 1.0f);
+    // Car paint → semi-metallic
+    Vector4 carpaintParams = readPsConstant(d3d9State, "fs_carpaint_params");
+    if (isNonZero(carpaintParams) && materialData.extractedMetallic < 0.0f)
+      materialData.extractedMetallic = 0.5f;
+    // Specular color luminance → metallic hint
+    Vector4 specColor = readPsConstant(d3d9State, "fs_specular_specular");
+    if (isNonZero(specColor)) {
+      float specLum = specColor[0] * 0.299f + specColor[1] * 0.587f + specColor[2] * 0.114f;
+      if (materialData.extractedRoughness < 0.0f)
+        materialData.extractedRoughness = std::clamp(1.0f - specLum * 0.5f, 0.01f, 1.0f);
+      if (materialData.extractedMetallic < 0.0f && specLum > 0.3f)
+        materialData.extractedMetallic = std::clamp(specLum, 0.0f, 1.0f);
+    }
+
+    // === EMISSIVE ===
+    // Only fs_incandescentGlow makes things glow. If the game set it, it glows. If not, it doesn't.
+    // fs_rimLightColour is a shading effect, NOT emissive.
+    Vector4 glowColor = readPsConstant(d3d9State, "fs_incandescentGlow");
+    if (isNonZero(glowColor)) {
+      materialData.extractedEmissiveColor = Vector3(glowColor[0], glowColor[1], glowColor[2]);
+      materialData.extractedEmissiveIntensity = 1.0f;
+    }
+
+    // Store emissive in D3D material for downstream detection
+    materialData.d3dMaterial.Emissive.r = materialData.extractedEmissiveColor[0];
+    materialData.d3dMaterial.Emissive.g = materialData.extractedEmissiveColor[1];
+    materialData.d3dMaterial.Emissive.b = materialData.extractedEmissiveColor[2];
+    materialData.d3dMaterial.Emissive.a = materialData.extractedEmissiveIntensity > 0.0f ? 1.0f : 0.0f;
+
+    // Populate existing tt* fields for backward compatibility with the existing as<OpaqueMaterialData>() path
+    if (materialData.extractedRoughness >= 0.0f)
+      materialData.ttRoughnessConstant = materialData.extractedRoughness;
+    materialData.ttSpecularIntensity = materialData.extractedSpecularPower;
+    float glowLum = materialData.extractedEmissiveColor[0] * 0.299f
+                  + materialData.extractedEmissiveColor[1] * 0.587f
+                  + materialData.extractedEmissiveColor[2] * 0.114f;
+    materialData.ttGlowIntensity = glowLum > 0.0f ? materialData.extractedEmissiveIntensity : -1.0f;
+  }
+  // NV-DXVK end
 }

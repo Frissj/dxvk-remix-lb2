@@ -63,4 +63,15 @@ namespace dxvk {
     * \param [out] fogState: fog structure to update
     */
   void setFogState(D3D9DeviceEx* pDevice, FogState& fogState);
+
+  /**
+    * \brief: Extracts material properties from programmable shader constants using CTAB lookup.
+    *         For games using ubershader systems (e.g. TT Games' Lego Batman 2), material color,
+    *         roughness, metallic, emissive etc. are stored in shader constants. This reads them
+    *         and populates PBR fields on the material data for correct RT rendering.
+    *
+    * \param [in] pDevice: parent D3D9 device
+    * \param [out] materialData: material data structure to update
+    */
+  void extractShaderConstantMaterial(D3D9DeviceEx* pDevice, LegacyMaterialData& materialData);
 }

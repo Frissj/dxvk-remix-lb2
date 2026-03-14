@@ -77,6 +77,9 @@ namespace dxvk {
     m_meta      = pModule->meta();
     m_constants = pModule->constants();
     m_maxDefinedConst = pModule->maxDefinedConstant();
+    // NV-DXVK start: store CTAB for shader constant extraction
+    m_ctab      = pModule->ctab();
+    // NV-DXVK end
 
     m_shaders[0]->setShaderKey(Key);
 

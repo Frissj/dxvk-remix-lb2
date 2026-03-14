@@ -1641,6 +1641,17 @@ struct LegacyMaterialData {
     return colorTextures[1];
   }
 
+  // TT Games engine extra maps and constants (set from d3d9 texture stages / PS constants)
+  TextureRef normalMapTexture;
+  float ttRoughnessConstant = -1.0f;  // from PS c20.x (kBRDFRoughness), -1 = not set
+  float ttSpecularIntensity = -1.0f;  // from PS c6.x (fs_specular_params), -1 = not set
+  float ttGlowIntensity = -1.0f;      // from PS c9.x (fs_incandescentGlow), -1 = not set
+  bool ttIsAdditiveBlend = false;     // true when D3D blend = SRCALPHA+ONE (glow pass)
+
+  const TextureRef& getNormalMapTexture() const {
+    return normalMapTexture;
+  }
+
   const Rc<DxvkSampler>& getSampler() const {
     return samplers[0];
   }
@@ -1718,6 +1729,17 @@ struct LegacyMaterialData {
   D3DMATERIAL9 d3dMaterial = {};
   bool isTextureFactorBlend = false;
   bool isVertexColorBakedLighting = true;
+
+  // NV-DXVK start: extracted PBR material properties from shader constants (ubershader emulation)
+  bool hasExtractedPBR = false;
+  Vector3 extractedAlbedoColor = Vector3(1.0f);
+  float extractedOpacity = 1.0f;
+  float extractedRoughness = -1.0f;       // -1 = not extracted, use default
+  float extractedMetallic = -1.0f;        // -1 = not extracted, use default
+  Vector3 extractedEmissiveColor = Vector3(0.0f);
+  float extractedEmissiveIntensity = 0.0f;
+  float extractedSpecularPower = 0.0f;
+  // NV-DXVK end
 
   void setHashOverride(XXH64_hash_t hash) {
     m_cachedHash = hash;

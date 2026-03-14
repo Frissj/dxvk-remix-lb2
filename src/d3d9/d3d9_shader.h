@@ -64,6 +64,10 @@ namespace dxvk {
 
     uint32_t GetMaxDefinedConstant() const { return m_maxDefinedConst; }
 
+    // NV-DXVK start: expose CTAB for shader constant extraction
+    const DxsoCtab& GetCtab() const { return m_ctab; }
+    // NV-DXVK end
+
   private:
 
     DxsoIsgn              m_isgn;
@@ -77,6 +81,10 @@ namespace dxvk {
     DxsoShaderMetaInfo    m_meta;
     DxsoDefinedConstants  m_constants;
     uint32_t              m_maxDefinedConst;
+
+    // NV-DXVK start: store CTAB for shader constant extraction
+    DxsoCtab              m_ctab;
+    // NV-DXVK end
 
     DxsoPermutations      m_shaders;
 

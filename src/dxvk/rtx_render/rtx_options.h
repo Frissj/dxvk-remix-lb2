@@ -348,6 +348,9 @@ namespace dxvk {
                     args.minValue = 0.0f, args.maxValue = 1.0f);
     RTX_OPTION("rtx", bool, vertexColorIsBakedLighting, true, "If true, brightness contribution will be removed from the vertex color by dividing each component by the largest component.");
     RTX_OPTION("rtx", bool, ignoreAllVertexColorBakedLighting, false, "If true, all baked lighting bound to all vertex colors will be ignored.");
+    RTX_OPTION("rtx", bool, enableShaderConstantExtraction, false,
+               "Extracts PBR material properties (albedo, roughness, metallic, emissive) from programmable shader constants via CTAB lookup.\n"
+               "Required for ubershader-based engines (TT Games: Lego Batman 2, etc.) where material data lives in PS/VS constants, not fixed-function state.");
     RTX_OPTION("rtx", bool, allowFSE, false,
                "A flag indicating if the application should be able to utilize exclusive full screen mode when set to true, otherwise force it to be disabled when set to false.\n"
                "Exclusive full screen may see performance benefits over other fullscreen modes at the cost of stability in some cases.\n"
