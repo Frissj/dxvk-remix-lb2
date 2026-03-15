@@ -233,19 +233,6 @@ namespace dxvk {
   void D3D9Rtx::processVertices(const VertexContext vertexContext[caps::MaxStreams], int vertexIndexOffset, RasterGeometry& geoData) {
     DxvkBufferSlice streamCopies[caps::MaxStreams] {};
 
-    // Log vertex declaration elements for debugging
-    if (m_drawCallID < 200) {
-      static uint32_t lastLoggedDC = UINT32_MAX;
-      if (m_drawCallID != lastLoggedDC) {
-        lastLoggedDC = m_drawCallID;
-        for (const auto& el : d3d9State().vertexDecl->GetElements()) {
-          Logger::info(str::format("[RTX-VtxDecl] Stream=", (uint32_t)el.Stream,
-            " Usage=", (uint32_t)el.Usage, " UsageIdx=", (uint32_t)el.UsageIndex,
-            " Type=", (uint32_t)el.Type, " Offset=", (uint32_t)el.Offset));
-        }
-      }
-    }
-
     // Process vertex buffers from CPU
     for (const auto& element : d3d9State().vertexDecl->GetElements()) {
       // Get vertex context
@@ -338,6 +325,7 @@ namespace dxvk {
   }
 
   bool D3D9Rtx::processRenderState() {
+    Logger::info(str::format("[GPU-DBG] processRenderState DC#", m_drawCallID, " checkpoint=0_ENTER"));
     DrawCallTransforms& transformData = m_activeDrawCallState.transformData;
 
     // When games use vertex shaders, the object to world transforms can be unreliable, and so we can ignore them.
@@ -370,31 +358,6 @@ namespace dxvk {
         const bool zTestEnabled = d3d9State().renderStates[D3DRS_ZENABLE] != D3DZB_FALSE;
         const bool alphaBlend = d3d9State().renderStates[D3DRS_ALPHABLENDENABLE];
 
-        // Per-frame draw call counter for logging
-        m_shaderCamDebugDrawCount++;
-
-        // Log every draw call's constants for the first few frames
-        {
-          static uint32_t debugFrameCount = 0;
-          static uint32_t lastFrameId = UINT32_MAX;
-          uint32_t curFrame = m_drawCallID;
-
-          // Use m_cameraFromConstsSetThisFrame as a proxy for "first draw this frame"
-          if (!m_cameraFromConstsSetThisFrame && debugFrameCount < 5) {
-            debugFrameCount++;
-          }
-
-          if (debugFrameCount <= 5 && m_shaderCamDebugDrawCount <= 30) {
-            Logger::info(str::format("[RTX-Cam-DC] frame=", debugFrameCount, " dc=", m_shaderCamDebugDrawCount,
-              " zWrite=", zWriteEnabled ? 1 : 0, " zTest=", zTestEnabled ? 1 : 0, " alphaBlend=", alphaBlend ? 1 : 0,
-              " vp[0][0]=", viewProj[0][0], " vp[1][1]=", viewProj[1][1],
-              " vp[2][3]=", viewProj[2][3], " vp[3][3]=", viewProj[3][3],
-              " vp[3][2]=", viewProj[3][2],
-              " isIdent=", isIdentityExact(viewProj) ? 1 : 0,
-              " det=", determinant(viewProj)));
-          }
-        }
-
         // Skip if the viewProj matrix is all zeros (constants not yet set)
         if (!isIdentityExact(viewProj) && std::abs(determinant(viewProj)) > 1e-10) {
           if (viewReg >= 0) {
@@ -412,40 +375,6 @@ namespace dxvk {
               bool validPerspective = std::abs(proj[3][3]) < 0.01f &&
                                      (std::abs(proj[2][3] - 1.0f) < 0.01f || std::abs(proj[2][3] + 1.0f) < 0.01f);
 
-              // Compute FOV for logging
-              float vFov = 2.0f * std::atan(1.0f / std::abs(proj[1][1])) * (180.0f / 3.14159265f);
-              float hFov = 2.0f * std::atan(1.0f / std::abs(proj[0][0])) * (180.0f / 3.14159265f);
-              float aspect = std::abs(proj[1][1]) > 0.001f ? std::abs(proj[0][0] / proj[1][1]) : 0.0f;
-              // aspect is inverted because proj[0][0] < proj[1][1] for wide screens
-              float aspectRatio = std::abs(proj[1][1]) > 0.001f ? std::abs(proj[1][1] / proj[0][0]) : 0.0f;
-              float nearPlane = std::abs(proj[2][2]) > 0.001f ? std::abs(proj[3][2] / proj[2][2]) : 0.0f;
-
-              // Log on camera set and whenever projection changes
-              {
-                static float lastProjDiag0 = 0.0f;
-                static float lastProjDiag1 = 0.0f;
-                bool projChanged = std::abs(proj[0][0] - lastProjDiag0) > 0.001f ||
-                                   std::abs(proj[1][1] - lastProjDiag1) > 0.001f;
-
-                if (!m_cameraFromConstsSetThisFrame || projChanged) {
-                  Logger::info(str::format("[RTX-Cam-Proj] ",
-                    m_cameraFromConstsSetThisFrame ? "CHANGE" : "SET",
-                    " validPersp=", validPerspective ? 1 : 0,
-                    " zWrite=", zWriteEnabled ? 1 : 0,
-                    " proj[0][0]=", proj[0][0], " proj[1][1]=", proj[1][1],
-                    " proj[2][2]=", proj[2][2], " proj[2][3]=", proj[2][3],
-                    " proj[3][2]=", proj[3][2], " proj[3][3]=", proj[3][3],
-                    " vFov=", vFov, "deg hFov=", hFov, "deg aspect=", aspectRatio,
-                    " near=", nearPlane,
-                    " view[3]=[", view[3][0], ",", view[3][1], ",", view[3][2], ",", view[3][3], "]"));
-
-                  if (projChanged) {
-                    lastProjDiag0 = proj[0][0];
-                    lastProjDiag1 = proj[1][1];
-                  }
-                }
-              }
-
               if (validPerspective) {
                 // Heuristic: zWrite=1 + zTest=0 is a compositing/depth-clear pass (fullscreen quad).
                 // zWrite=0 + zTest=0 is UI/overlay. Both should be skipped from raytracing entirely.
@@ -460,15 +389,6 @@ namespace dxvk {
                 // Set external camera from z-write+z-test draws (actual 3D scene geometry).
                 // Update every frame to track camera movement.
                 if (zWriteEnabled) {
-                  if (!m_cameraFromConstsSetThisFrame) {
-                    Logger::info(str::format("[RTX-Cam-ExtCam] Setting external camera: vFov=", vFov,
-                      "deg hFov=", hFov, "deg aspect=", aspectRatio, " near=", nearPlane,
-                      " view:\n",
-                      "  [", view[0][0], ", ", view[0][1], ", ", view[0][2], ", ", view[0][3], "]\n",
-                      "  [", view[1][0], ", ", view[1][1], ", ", view[1][2], ", ", view[1][3], "]\n",
-                      "  [", view[2][0], ", ", view[2][1], ", ", view[2][2], ", ", view[2][3], "]\n",
-                      "  [", view[3][0], ", ", view[3][1], ", ", view[3][2], ", ", view[3][3], "]"));
-                  }
                   m_cameraFromConstsSetThisFrame = true;
                   m_parent->EmitCs([cView = view, cProj = proj](DxvkContext* ctx) {
                     static_cast<RtxContext*>(ctx)->getSceneManager().getCameraManager()
@@ -504,6 +424,8 @@ namespace dxvk {
       }
     }
 
+    Logger::info(str::format("[GPU-DBG] processRenderState DC#", m_drawCallID, " checkpoint=1_CAMERA_DONE"));
+
     transformData.objectToView = transformData.worldToView * transformData.objectToWorld;
 
     // Some games pass invalid matrices which D3D9 apparently doesnt care about.
@@ -537,6 +459,8 @@ namespace dxvk {
       }
     }
 
+    Logger::info(str::format("[GPU-DBG] processRenderState DC#", m_drawCallID, " checkpoint=2_CLIPS_DONE"));
+
     if (m_flags.test(D3D9RtxFlag::DirtyLights)) {
       m_flags.clr(D3D9RtxFlag::DirtyLights);
 
@@ -545,6 +469,11 @@ namespace dxvk {
       for (auto idx : d3d9State().enabledLightIndices) {
         if (idx == UINT32_MAX)
           continue;
+        if (idx >= d3d9State().lights.size() || !d3d9State().lights[idx].has_value()) {
+          Logger::err(str::format("[GPU-DBG] DC#", m_drawCallID, " INVALID LIGHT idx=", idx,
+            " lightsSize=", d3d9State().lights.size()));
+          continue;
+        }
         activeLightsRT.push_back(d3d9State().lights[idx].value());
       }
 
@@ -553,8 +482,30 @@ namespace dxvk {
         });
     }
 
+    Logger::info(str::format("[GPU-DBG] processRenderState DC#", m_drawCallID, " checkpoint=3_LIGHTS_DONE"));
+
+    Logger::info(str::format("[GPU-DBG] processRenderState DC#", m_drawCallID, " checkpoint=3_LIGHTS_STENCIL"));
+
     // Stencil state is important to Remix
     m_activeDrawCallState.stencilEnabled = d3d9State().renderStates[D3DRS_STENCILENABLE];
+
+    // Process textures - log which stages have textures bound for crash diagnosis
+    {
+      std::string boundTex;
+      for (int s = 0; s < 16; s++) {
+        if (d3d9State().textures[s] != nullptr) {
+          D3D9CommonTexture* ct = GetCommonTexture(d3d9State().textures[s]);
+          bool hasImg = ct && ct->GetImage() != nullptr;
+          boundTex += str::format(" s", s, "=", hasImg ? "ok" : "NOIMG");
+          if (ct && !hasImg) {
+            boundTex += str::format("(type=", (int)ct->GetType(), ")");
+          }
+        }
+      }
+      Logger::info(str::format("[GPU-DBG] processRenderState DC#", m_drawCallID,
+        " checkpoint=4_PRE_TEXTURES usesPS=", m_parent->UseProgrammablePS() ? 1 : 0,
+        boundTex));
+    }
 
     // Process textures
     if (m_parent->UseProgrammablePS()) {
@@ -825,20 +776,53 @@ namespace dxvk {
     m_activeDrawCallState.categories = 0;
     m_activeDrawCallState.materialData = {};
 
+    // === GPU DEBUG LOGGING (always on - need to catch crash) ===
+    const bool gpuDbgLog = true;
+    Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID,
+      " primType=", (uint32_t)drawContext.PrimitiveType,
+      " primCount=", drawContext.PrimitiveCount,
+      " vtxCount=", geoData.vertexCount,
+      " indexed=", drawContext.Indexed ? 1 : 0,
+      " usesVS=", m_parent->UseProgrammableVS() ? 1 : 0,
+      " usesPS=", m_parent->UseProgrammablePS() ? 1 : 0));
+
     // Fetch all the legacy state (colour modes, alpha test, etc...)
     setLegacyMaterialState(m_parent, m_parent->m_alphaSwizzleRTs & (1 << kRenderTargetIndex), m_activeDrawCallState.materialData);
 
-    // Fetch fog state 
+    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=LEGACY_MAT done"));
+
+    // Fetch fog state
+    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=FOG_STATE begin"));
     setFogState(m_parent, m_activeDrawCallState.fogState);
+    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=FOG_STATE done"));
 
     // Fetch all the render state and send it to rtx context (textures, transforms, etc.)
+    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=RENDER_STATE begin"));
     if (!processRenderState()) {
+      if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=RENDER_STATE SKIPPED"));
       return prepareFlagsForIgnoredDraws;
     }
+    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=RENDER_STATE done"));
 
     // NV-DXVK start: extract material properties from programmable shader constants
     // Must be after processRenderState() so that textures are loaded and usesTexture() works
-    extractShaderConstantMaterial(m_parent, m_activeDrawCallState.materialData);
+    try {
+      extractShaderConstantMaterial(m_parent, m_activeDrawCallState.materialData);
+      if (gpuDbgLog) {
+        Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=SHADER_EXTRACT done",
+          " hasExtPBR=", m_activeDrawCallState.materialData.hasExtractedPBR ? 1 : 0,
+          " albedo=(", m_activeDrawCallState.materialData.extractedAlbedoColor[0],
+          ",", m_activeDrawCallState.materialData.extractedAlbedoColor[1],
+          ",", m_activeDrawCallState.materialData.extractedAlbedoColor[2], ")",
+          " rough=", m_activeDrawCallState.materialData.extractedRoughness,
+          " metal=", m_activeDrawCallState.materialData.extractedMetallic,
+          " emissI=", m_activeDrawCallState.materialData.extractedEmissiveIntensity,
+          " usesTex=", m_activeDrawCallState.materialData.usesTexture() ? 1 : 0,
+          " tFactor=0x", std::hex, m_activeDrawCallState.materialData.tFactor, std::dec));
+      }
+    } catch (...) {
+      Logger::err(str::format("[GPU-DBG] DC#", m_drawCallID, " step=SHADER_EXTRACT EXCEPTION"));
+    }
     // NV-DXVK end
 
     // Max offseted index value within a buffer slice that geoData contains
@@ -846,14 +830,20 @@ namespace dxvk {
 
     // Copy all the vertices into a staging buffer.  Assign fields of the geoData structure.
     processVertices(vertexContext, vertexIndexOffset, geoData);
+    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=VERTICES done"));
+
     geoData.futureGeometryHashes = computeHash(geoData, maxOffsetedIndex);
     geoData.futureBoundingBox = computeAxisAlignedBoundingBox(geoData);
-    
+
+    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=HASH_BBOX done"));
+
     // Process skinning data
     m_activeDrawCallState.futureSkinningData = processSkinning(geoData);
 
     // Hash material data
     m_activeDrawCallState.materialData.updateCachedHash();
+
+    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=SKIN_MATHASH done"));
 
     // For shader based drawcalls we also want to capture the vertex shader output
     const bool needVertexCapture = m_parent->UseProgrammableVS() && useVertexCapture();
@@ -865,12 +855,24 @@ namespace dxvk {
     m_activeDrawCallState.usesPixelShader = m_parent->UseProgrammablePS();
 
     if (m_activeDrawCallState.usesVertexShader) {
-      m_activeDrawCallState.programmableVertexShaderInfo = d3d9State().vertexShader->GetCommonShader()->GetInfo();
+      if (d3d9State().vertexShader != nullptr && d3d9State().vertexShader->GetCommonShader() != nullptr) {
+        m_activeDrawCallState.programmableVertexShaderInfo = d3d9State().vertexShader->GetCommonShader()->GetInfo();
+      } else {
+        Logger::err(str::format("[GPU-DBG] DC#", m_drawCallID, " VS flagged but shader/common is NULL!",
+          " vsPtr=", (uintptr_t)d3d9State().vertexShader.ptr()));
+      }
     }
-    
+
     if (m_activeDrawCallState.usesPixelShader) {
-      m_activeDrawCallState.programmablePixelShaderInfo = d3d9State().pixelShader->GetCommonShader()->GetInfo();
+      if (d3d9State().pixelShader != nullptr && d3d9State().pixelShader->GetCommonShader() != nullptr) {
+        m_activeDrawCallState.programmablePixelShaderInfo = d3d9State().pixelShader->GetCommonShader()->GetInfo();
+      } else {
+        Logger::err(str::format("[GPU-DBG] DC#", m_drawCallID, " PS flagged but shader/common is NULL!",
+          " psPtr=", (uintptr_t)d3d9State().pixelShader.ptr()));
+      }
     }
+
+    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=SHADER_INFO done"));
 
     // --- Texture/Shader Debug Capture ---
     if (g_texShaderDebug.enabled && !g_texShaderDebug.freezeFrame) {
@@ -964,6 +966,8 @@ namespace dxvk {
     assert(status == RtxGeometryStatus::RayTraced);
 
     const bool preserveOriginalDraw = needVertexCapture;
+
+    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=COMPLETE camType=", (uint32_t)m_activeDrawCallState.cameraType));
 
     return
       PrepareDrawFlag::CommitToRayTracing |
@@ -1245,7 +1249,12 @@ namespace dxvk {
           continue;
         }
 
-        const XXH64_hash_t texHash = texture->GetSampleView(true)->image()->getHash();
+        auto sampleView = texture->GetSampleView(true);
+        if (sampleView == nullptr || sampleView->image() == nullptr) {
+          Logger::err(str::format("[GPU-DBG] DC#", m_drawCallID, " NULL sampleView/image at FF stage=", stage));
+          continue;
+        }
+        const XXH64_hash_t texHash = sampleView->image()->getHash();
 
         // Currently we only support regular textures, skip lightmaps.
         if (lookupHash(RtxOptions::lightmapTextures(), texHash)) {
@@ -1283,6 +1292,8 @@ namespace dxvk {
     // We need to find the real diffuse at a higher stage and use it instead of stage 0.
     int recommendedAlbedoSampler = -1;
 
+    Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " checkpoint=PT0_ENTER"));
+
     // Periodic stage dump: log all DCs for one frame every 3 seconds
     {
       static auto s_lastDump = std::chrono::steady_clock::now();
@@ -1303,7 +1314,7 @@ namespace dxvk {
         for (int s = 0; s < 16; s++) {
           if (d3d9State().textures[s] != nullptr) {
             D3D9CommonTexture* t = GetCommonTexture(d3d9State().textures[s]);
-            if (t) {
+            if (t && t->GetImage() != nullptr) {
               const auto h = t->GetImage()->getHash();
               stages += str::format(" s", s, "=", t->Desc()->Width, "x", t->Desc()->Height,
                 "[", std::hex, h, std::dec, "]");
@@ -1350,6 +1361,7 @@ namespace dxvk {
           psConsts));
       }
     }
+    Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " checkpoint=PT1_STAGE_DUMP_DONE"));
     if constexpr (!FixedFunction) {
       if (forceTextureStage() < 0) {
         // TT Games engine: stage 0 = lightmap, stage 5 = diffuse.
@@ -1377,6 +1389,9 @@ namespace dxvk {
       }
     }
 
+    Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID,
+      " checkpoint=PT2_PRE_LOOP recAlbedo=", recommendedAlbedoSampler));
+
     for (uint32_t idx = 0, textureID = 0; idx < NumTexcoordBins && textureID < LegacyMaterialData::kMaxSupportedTextures; idx++) {
       uint8_t stage;
       if (FixedFunction) {
@@ -1396,12 +1411,15 @@ namespace dxvk {
         continue;
 
       D3D9CommonTexture* pTexInfo = GetCommonTexture(d3d9State().textures[stage]);
-      assert(pTexInfo != nullptr);
+      if (pTexInfo == nullptr) {
+        Logger::err(str::format("[GPU-DBG] DC#", m_drawCallID, " NULL CommonTexture at stage=", (int)stage));
+        continue;
+      }
 
       // Send the texture stage state for first texture slot (or 0th stage if no texture)
       if (textureID == 0) {
-        if (pTexInfo->GetImage()->getHash() == kEmptyHash) {
-          ONCE(Logger::info("[RTX-Compatibility-Info] Texture 0 without valid hash detected, skipping drawcall."));
+        if (pTexInfo->GetImage() == nullptr || pTexInfo->GetImage()->getHash() == kEmptyHash) {
+          Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " tex0 NULL image or empty hash, stage=", (int)stage));
           return false;
         }
 
@@ -1430,50 +1448,50 @@ namespace dxvk {
       auto shaderSampler = RemapStateSamplerShader(stage);
       m_activeDrawCallState.materialData.colorTextureSlot[textureID] = computeResourceSlotId(shaderSampler.first, DxsoBindingType::Image, uint32_t(shaderSampler.second));
 
-      if (!FixedFunction && m_drawCallID < 50) {
-        const auto imgHash = pTexInfo->GetSampleView(srgb)->image()->getHash();
-        Logger::info(str::format("[RTX-TexBind] DC#", m_drawCallID,
-          " texID=", textureID, " fromStage=", (uint32_t)stage,
-          " ", pTexInfo->Desc()->Width, "x", pTexInfo->Desc()->Height,
-          " imgHash=0x", std::hex, imgHash, std::dec));
-      }
-
       ++textureID;
     }
+
+    Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " checkpoint=PT3_LOOP_DONE firstStage=", firstStage));
 
     // TT Games engine: populate extra material maps from higher texture stages
     // s6 = normal map, s7 = specular/roughness map
     if constexpr (!FixedFunction) {
       auto trySetExtraTexture = [&](int stageIdx, TextureRef& outRef) {
+        Logger::info(str::format("[GPU-DBG] trySetExtraTexture DC#", m_drawCallID, " stage=", stageIdx));
         if (d3d9State().textures[stageIdx] == nullptr)
           return;
         D3D9CommonTexture* tex = GetCommonTexture(d3d9State().textures[stageIdx]);
         if (tex == nullptr)
           return;
         const auto* desc = tex->Desc();
+        Logger::info(str::format("[GPU-DBG] trySetExtraTexture DC#", m_drawCallID, " stage=", stageIdx,
+          " size=", desc->Width, "x", desc->Height, " isRT=", tex->IsRenderTarget() ? 1 : 0));
         // Skip tiny utility textures and render targets
         if (desc->Width <= 1 && desc->Height <= 1)
           return;
         if (tex->IsRenderTarget() || tex->IsDepthStencil())
           return;
         // Skip if hash is 0 (blank texture)
+        if (tex->GetImage() == nullptr) {
+          Logger::err(str::format("[GPU-DBG] trySetExtraTexture DC#", m_drawCallID, " stage=", stageIdx, " NULL GetImage!"));
+          return;
+        }
         if (tex->GetImage()->getHash() == 0)
           return;
         // Skip if same texture as diffuse (s5) — no separate map
         if (recommendedAlbedoSampler >= 0 && d3d9State().textures[recommendedAlbedoSampler] != nullptr) {
           D3D9CommonTexture* diffTex = GetCommonTexture(d3d9State().textures[recommendedAlbedoSampler]);
-          if (diffTex && tex->GetImage()->getHash() == diffTex->GetImage()->getHash())
+          if (diffTex && diffTex->GetImage() != nullptr && tex->GetImage()->getHash() == diffTex->GetImage()->getHash())
             return;
         }
         const bool srgb = d3d9State().samplerStates[stageIdx][D3DSAMP_SRGBTEXTURE] & 0x1;
         outRef = TextureRef(tex->GetSampleView(srgb));
+        Logger::info(str::format("[GPU-DBG] trySetExtraTexture DC#", m_drawCallID, " stage=", stageIdx, " SET OK"));
       };
 
+      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT3a_PRE_EXTRA_TEX"));
       trySetExtraTexture(6, m_activeDrawCallState.materialData.normalMapTexture);
-
-      // Read PS float constants for material properties via CTAB lookup
-      // (Previously used hardcoded c6/c9/c20 registers which break across shader variants)
-      // extractShaderConstantMaterial() handles this now via proper CTAB name→register mapping
+      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT3b_POST_EXTRA_TEX"));
 
       // Detect additive blend (SRCALPHA + ONE) = glow/emissive pass
       const bool blendOn = d3d9State().renderStates[D3DRS_ALPHABLENDENABLE] != 0;
@@ -1481,42 +1499,28 @@ namespace dxvk {
       const DWORD dstB = d3d9State().renderStates[D3DRS_DESTBLEND];
       // D3DBLEND_SRCALPHA=5, D3DBLEND_ONE=2
       m_activeDrawCallState.materialData.ttIsAdditiveBlend = blendOn && (dstB == D3DBLEND_ONE);
-
-      // Log D3D material + VS constants for emissive draws to find actual glow values
-      if (m_activeDrawCallState.materialData.ttIsAdditiveBlend) {
-        static uint32_t s_emissiveLogCount = 0;
-        if (s_emissiveLogCount < 30) {
-          s_emissiveLogCount++;
-          const auto& mat = d3d9State().material;
-          // Check vertex shader constants too (glow color might be in VS)
-          std::string vsConsts;
-          for (int r = 0; r < 10; r++) {
-            const auto& vc = d3d9State().vsConsts.fConsts[r];
-            if (vc[0] != 0.0f || vc[1] != 0.0f || vc[2] != 0.0f || vc[3] != 0.0f) {
-              vsConsts += str::format(" vs", r, "=(", vc[0], ",", vc[1], ",", vc[2], ",", vc[3], ")");
-            }
-          }
-          // Also check texture factor (D3DRS_TEXTUREFACTOR)
-          const DWORD texFactor = d3d9State().renderStates[D3DRS_TEXTUREFACTOR];
-          Logger::info(str::format("[RTX-Emissive] DC#", m_drawCallID,
-            " D3DMat.Emissive=(", mat.Emissive.r, ",", mat.Emissive.g, ",", mat.Emissive.b, ",", mat.Emissive.a, ")",
-            " D3DMat.Diffuse=(", mat.Diffuse.r, ",", mat.Diffuse.g, ",", mat.Diffuse.b, ",", mat.Diffuse.a, ")",
-            " texFactor=0x", std::hex, texFactor, std::dec,
-            vsConsts.empty() ? "" : vsConsts));
-        }
-      }
+      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT3c_BLEND_DONE additive=", m_activeDrawCallState.materialData.ttIsAdditiveBlend ? 1 : 0));
     }
 
     // Update the drawcall state with texture stage info
+    Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT4_PRE_setTextureStageState firstStage=", firstStage,
+      " useTFactor=", useStageTextureFactorBlending ? 1 : 0, " useMultiTFactor=", useMultipleStageTextureFactorBlending ? 1 : 0));
     setTextureStageState(d3d9State(), firstStage, useStageTextureFactorBlending, useMultipleStageTextureFactorBlending,
                          m_activeDrawCallState.materialData, m_activeDrawCallState.transformData);
+    Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT5_POST_setTextureStageState"));
 
     if (d3d9State().textures[firstStage]) {
+      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT6_PRE_setupCategories"));
       m_activeDrawCallState.setupCategoriesForTexture();
+      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT7_POST_setupCategories"));
 
       // Track the texture hash before checking if it should be ignored
-      // This ensures we track all textures sent by the game, not just the ones that are actually rendered.
-      const XXH64_hash_t textureHash = m_activeDrawCallState.materialData.getColorTexture().getImageHash();
+      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT8_PRE_getColorTexture"));
+      const auto& colorTex = m_activeDrawCallState.materialData.getColorTexture();
+      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT8a_colorTex valid=", colorTex.isValid() ? 1 : 0,
+        " empty=", colorTex.isImageEmpty() ? 1 : 0));
+      const XXH64_hash_t textureHash = colorTex.getImageHash();
+      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT9_hash=0x", std::hex, textureHash, std::dec));
 
       // Flag smooth normals category at the d3d9 layer
       m_activeDrawCallState.setCategory(InstanceCategories::SmoothNormals, lookupHash(RtxOptions::smoothNormalsTextures(), textureHash));
@@ -1525,15 +1529,16 @@ namespace dxvk {
           static_cast<RtxContext*>(ctx)->getSceneManager().trackReplacementMaterialHash(textureHash);
         });
       }
-      
+      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT10_POST_trackHash"));
+
       // Check if an ignore texture is bound
       if (m_activeDrawCallState.getCategoryFlags().test(InstanceCategories::Ignore)) {
+        Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT_IGNORE returning false"));
         return false;
       }
 
       if (m_activeDrawCallState.testCategoryFlags(InstanceCategories::Terrain)) {
         if (RtxOptions::terrainAsDecalsEnabledIfNoBaker() && !TerrainBaker::enableBaking()) {
-
           m_activeDrawCallState.removeCategory(InstanceCategories::Terrain);
           m_activeDrawCallState.setCategory(InstanceCategories::DecalStatic, true);
 
@@ -1548,16 +1553,18 @@ namespace dxvk {
       }
 
       if (!m_forceGeometryCopy && RtxOptions::alwaysCopyDecalGeometries()) {
-        // Only poke decal hashes when option is enabled.
         m_forceGeometryCopy |= m_activeDrawCallState.testCategoryFlags(CATEGORIES_REQUIRE_GEOMETRY_COPY);
       }
+      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT11_POST_categories"));
     }
 
+    Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT12_PRE_texcoordIndex firstStage=", firstStage));
     if (forceTexcoordIndex() >= 0) {
       m_texcoordIndex = forceTexcoordIndex();
     } else {
       m_texcoordIndex = d3d9State().textureStages[firstStage][DXVK_TSS_TEXCOORDINDEX];
     }
+    Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT13_DONE texcoordIdx=", m_texcoordIndex));
 
     // Log texture selection details — show all stages so user can identify RT hashes
     if (!FixedFunction && m_drawCallID < 50) {

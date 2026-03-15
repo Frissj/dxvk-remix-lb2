@@ -572,10 +572,15 @@ namespace dxvk {
       m_cachedReflexFrameId = cachedReflexFrameId;
 
       // Update all the GPU buffers needed to describe the scene
+      static uint32_t s_rtxFrameDbg = 0;
+      s_rtxFrameDbg++;
+      Logger::info(str::format("[GPU-DBG] RTX prepareSceneData BEGIN (rtxFrame=", s_rtxFrameDbg, ")"));
       getSceneManager().prepareSceneData(this, m_execBarriers);
-      
+      Logger::info(str::format("[GPU-DBG] RTX prepareSceneData END (rtxFrame=", s_rtxFrameDbg, ")"));
+
       // If we really don't have any RT to do, just bail early (could be UI/menus rendering)
       if (getSceneManager().getSurfaceBuffer() != nullptr) {
+        Logger::info("[GPU-DBG] RTX surfaceBuffer valid, starting render pipeline");
 
         VkExtent3D downscaledExtent = onFrameBegin(targetImage->info().extent);
 
@@ -595,10 +600,14 @@ namespace dxvk {
         updateRaytraceArgsConstantBuffer(rtOutput, downscaledExtent, targetImage->info().extent);
 
         // Volumetric Lighting
+        Logger::info("[GPU-DBG] RTX dispatchVolumetrics BEGIN");
         dispatchVolumetrics(rtOutput);
-        
+        Logger::info("[GPU-DBG] RTX dispatchVolumetrics END");
+
         // Path Tracing
+        Logger::info("[GPU-DBG] RTX dispatchPathTracing BEGIN");
         dispatchPathTracing(rtOutput);
+        Logger::info("[GPU-DBG] RTX dispatchPathTracing END");
 
         // Neural Radiance Cache
         m_common->metaNeuralRadianceCache().dispatchTrainingAndResolve(*this, rtOutput);
@@ -616,7 +625,9 @@ namespace dxvk {
         }
 
         // Demodulation
+        Logger::info("[GPU-DBG] RTX dispatchDemodulate BEGIN");
         dispatchDemodulate(rtOutput);
+        Logger::info("[GPU-DBG] RTX dispatchDemodulate END");
 
         // Note: Primary direct diffuse/specular radiance textures noisy and in a demodulated state after demodulation step.
         if (captureScreenImage && captureDebugImage) {
@@ -625,7 +636,9 @@ namespace dxvk {
         }
 
         // Denoising
+        Logger::info("[GPU-DBG] RTX dispatchDenoise BEGIN");
         dispatchDenoise(rtOutput);
+        Logger::info("[GPU-DBG] RTX dispatchDenoise END");
 
         // Note: Primary direct diffuse/specular radiance textures denoised but in a still demodulated state after denoising step.
         if (captureScreenImage && captureDebugImage) {
@@ -634,7 +647,9 @@ namespace dxvk {
         }
 
         // Composition
+        Logger::info("[GPU-DBG] RTX dispatchComposite BEGIN");
         dispatchComposite(rtOutput);
+        Logger::info("[GPU-DBG] RTX dispatchComposite END");
 
         // Post composite Debug View that may overwrite Composite output
         dispatchReplaceCompositeWithDebugView(rtOutput);

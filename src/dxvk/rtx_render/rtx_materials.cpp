@@ -98,19 +98,6 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
     if (getColorTexture().isValid()) {
       opaqueMat.setEmissiveColorTexture(getColorTexture());
     }
-    static uint32_t s_emMatLog = 0;
-    if (s_emMatLog < 10) {
-      s_emMatLog++;
-      Logger::info(str::format("[RTX-EmMat] ttIsAdditiveBlend=1",
-        " colorTex=", getColorTexture().isValid() ? "valid" : "INVALID",
-        " colorTexEmpty=", getColorTexture().isImageEmpty() ? "YES" : "no",
-        " hash=0x", std::hex, getHash(), std::dec,
-        " glowI=", ttGlowIntensity,
-        " albedo=", opaqueMat.getAlbedoOpacityTexture().isValid() ? "valid" : "INVALID",
-        " emTex=", opaqueMat.getEmissiveColorTexture().isValid() ? "valid" : "INVALID",
-        " emI=", opaqueMat.getEmissiveIntensity(),
-        " emEn=", opaqueMat.getEnableEmission() ? 1 : 0));
-    }
   }
 
   // NV-DXVK start: apply extracted PBR material properties from shader constants (ubershader emulation)

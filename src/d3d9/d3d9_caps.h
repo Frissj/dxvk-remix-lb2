@@ -25,11 +25,15 @@ namespace dxvk::caps {
 
   constexpr uint32_t MaxTransforms                = 10 + 256;
 
-  constexpr uint32_t TextureStageCount           = MaxSimultaneousTextures;
-
   constexpr uint32_t MaxEnabledLights             = 8;
 
   constexpr uint32_t MaxTexturesVS                = 4;
   constexpr uint32_t MaxTexturesPS                = 16;
+
+  // Expanded to MaxTexturesPS (16) to support TT Games engine which binds
+  // diffuse/normal/etc textures at sampler slots 5-15 via programmable shaders.
+  // D3D9 fixed-function only uses 8 stages, but the state array must cover
+  // all PS sampler slots so setTextureStageState doesn't go OOB.
+  constexpr uint32_t TextureStageCount           = MaxTexturesPS;
 
 }

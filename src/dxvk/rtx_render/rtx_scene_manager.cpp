@@ -1595,10 +1595,14 @@ namespace dxvk {
     m_instanceManager.createViewModelInstances(ctx, m_cameraManager, m_rayPortalManager);
     m_instanceManager.createPlayerModelVirtualInstances(ctx, m_cameraManager, m_rayPortalManager);
 
+    Logger::info(str::format("[GPU-DBG] mergeInstancesIntoBlas BEGIN instances=", m_instanceManager.getActiveCount()));
     m_accelManager.mergeInstancesIntoBlas(ctx, execBarriers, textureManager.getTextureTable(), m_cameraManager, m_instanceManager, m_opacityMicromapManager.get());
+    Logger::info("[GPU-DBG] mergeInstancesIntoBlas END");
 
     // Call on the other managers to prepare their GPU data for the current scene
+    Logger::info("[GPU-DBG] accelManager.prepareSceneData BEGIN");
     m_accelManager.prepareSceneData(ctx, execBarriers, m_instanceManager);
+    Logger::info("[GPU-DBG] accelManager.prepareSceneData END");
     m_lightManager.prepareSceneData(ctx, m_cameraManager);
 
     // Upload surface material buffer BEFORE the GPU culling dispatch so the
@@ -1663,10 +1667,14 @@ namespace dxvk {
     // in m_vkInstanceBuffer with proper transforms and masks, copies per-instance
     // surface and material data from templates. Must run after prepareSceneData
     // (which uploads placeholders) and before buildTlas.
+    Logger::info("[GPU-DBG] dispatchPointInstancerCulling BEGIN");
     m_accelManager.dispatchPointInstancerCulling(ctx, m_cameraManager, m_surfaceMaterialBuffer);
+    Logger::info("[GPU-DBG] dispatchPointInstancerCulling END");
 
     // Build the TLAS
+    Logger::info("[GPU-DBG] buildTlas BEGIN");
     m_accelManager.buildTlas(ctx);
+    Logger::info("[GPU-DBG] buildTlas END");
 
     // Todo: These updates require a lot of temporary buffer allocations and memcopies, ideally we should memcpy directly into a mapped pointer provided by Vulkan,
     // but we have to create a buffer to pass to DXVK's updateBuffer for now.
