@@ -123,6 +123,22 @@ namespace dxvk {
     return uint32_t(std::max(g_blasCount, 0));
   }
 
+  uint64_t AccelManager::BlasBucket::computeBucketKey(const RtInstance* instance) {
+    // Pack all compatibility fields into non-overlapping bit ranges of a 64-bit key.
+    // Bucket merging requires: mask, SBT offset, customIndexFlags, instanceFlags,
+    // usesUnorderedApproximations, and isSubsurface to all match.
+    // Layout: [63:sss][62:unord][61-56:reserved][55-32:customIndexFlags][31-16:SBT][15-8:flags][7-0:mask]
+    const auto& vkInst = instance->getVkInstance();
+    uint64_t key = 0;
+    key |= uint64_t(vkInst.mask);                                                            // bits 0-7
+    key |= uint64_t(uint8_t(vkInst.flags)) << 8;                                             // bits 8-15
+    key |= uint64_t(uint16_t(vkInst.instanceShaderBindingTableRecordOffset)) << 16;           // bits 16-31
+    key |= uint64_t(vkInst.instanceCustomIndex & ~uint32_t(CUSTOM_INDEX_SURFACE_MASK)) << 32; // bits 32-55
+    if (instance->usesUnorderedApproximations()) key |= uint64_t(1) << 62;
+    if (instance->isSubsurface()) key |= uint64_t(1) << 63;
+    return key;
+  }
+
   bool AccelManager::BlasBucket::tryAddInstance(RtInstance* instance) {
     const uint8_t geometryInstanceMask = instance->getVkInstance().mask;
     const uint32_t geometryCustomIndexFlags = instance->getVkInstance().instanceCustomIndex & ~uint32_t(CUSTOM_INDEX_SURFACE_MASK);
@@ -450,6 +466,9 @@ namespace dxvk {
     std::vector<std::unique_ptr<BlasBucket>> blasBuckets;
     blasBuckets.reserve(instances.size());
 
+    // Hash map for O(1) bucket lookup instead of O(N) linear scan
+    std::unordered_map<uint64_t, BlasBucket*> bucketMap;
+
     size_t totalScratchMemory = 0;
 
     // NOTE: Would like to use the BLAS Linked instances here, but that misses viewmodel and virtual instances
@@ -535,21 +554,17 @@ namespace dxvk {
           geometry.geometry.triangles.transformData.deviceAddress = transformDeviceAddress;
         }
 
-        // Try to merge the instance into one of the blasBuckets
-        bool merged = false;
-        for (auto& bucket : blasBuckets) {
-          if (bucket->tryAddInstance(instance)) {
-            merged = true;
-            break;
-          }
-        }
-
-        // The instance couldn't be merged into any bucket - make a new one
-        if (!merged) {
+        // O(1) hash-based bucket lookup instead of O(N) linear scan.
+        // The key is a lossless encoding of all compatibility fields, so
+        // every instance with the same key is guaranteed merge-compatible.
+        const uint64_t bucketKey = BlasBucket::computeBucketKey(instance);
+        auto bucketIt = bucketMap.find(bucketKey);
+        if (bucketIt != bucketMap.end()) {
+          bucketIt->second->tryAddInstance(instance);
+        } else {
           auto newBucket = std::make_unique<BlasBucket>();
-          merged = newBucket->tryAddInstance(instance);
-          assert(merged);
-
+          newBucket->tryAddInstance(instance);
+          bucketMap[bucketKey] = newBucket.get();
           blasBuckets.push_back(std::move(newBucket));
         }
 
@@ -806,15 +821,20 @@ namespace dxvk {
       m_device->vkd()->vkGetAccelerationStructureBuildSizesKHR(m_device->handle(), VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
                                                                &buildInfo, bucket->primitiveCounts.data(), &sizeInfo);
 
-      // Try to find an existing BLAS that is minimally sufficient to fit this bucket of geometries
+      // Try to find an existing BLAS that is minimally sufficient to fit this bucket of geometries.
+      // Scan with early-out: stop as soon as we find an exact-size match (common after first frame).
       PooledBlas* selectedBlas = nullptr;
+      const uint32_t keepFrames = 1 + (RtxOptions::enablePreviousTLAS() ? 1u : 0u);
       for (const auto& blas : m_blasPool) {
         size_t bufferSize = blas->accelStructure->info().size;
-        uint32_t paddedLastTouched = blas->frameLastTouched + 1 + (RtxOptions::enablePreviousTLAS() ? 1u : 0u); /* note: +2 because frameLastTouched is unsigned and init'd with UINT32_MAX, and keep the BLAS'es for one extra frame for previous TLAS access */
+        uint32_t paddedLastTouched = blas->frameLastTouched + keepFrames;
         if (bufferSize >= sizeInfo.accelerationStructureSize &&
             (!selectedBlas || bufferSize < selectedBlas->accelStructure->info().size) &&
             paddedLastTouched <= currentFrame) {
           selectedBlas = blas.ptr();
+          // Exact match - no need to keep searching for a better fit
+          if (bufferSize == sizeInfo.accelerationStructureSize)
+            break;
         }
       }
 

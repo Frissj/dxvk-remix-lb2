@@ -572,15 +572,12 @@ namespace dxvk {
       m_cachedReflexFrameId = cachedReflexFrameId;
 
       // Update all the GPU buffers needed to describe the scene
-      static uint32_t s_rtxFrameDbg = 0;
-      s_rtxFrameDbg++;
-      Logger::info(str::format("[GPU-DBG] RTX prepareSceneData BEGIN (rtxFrame=", s_rtxFrameDbg, ")"));
+      auto tScene0 = std::chrono::high_resolution_clock::now();
       getSceneManager().prepareSceneData(this, m_execBarriers);
-      Logger::info(str::format("[GPU-DBG] RTX prepareSceneData END (rtxFrame=", s_rtxFrameDbg, ")"));
+      auto tScene1 = std::chrono::high_resolution_clock::now();
 
       // If we really don't have any RT to do, just bail early (could be UI/menus rendering)
       if (getSceneManager().getSurfaceBuffer() != nullptr) {
-        Logger::info("[GPU-DBG] RTX surfaceBuffer valid, starting render pipeline");
 
         VkExtent3D downscaledExtent = onFrameBegin(targetImage->info().extent);
 
@@ -598,16 +595,15 @@ namespace dxvk {
 
         // Generate ray tracing constant buffer
         updateRaytraceArgsConstantBuffer(rtOutput, downscaledExtent, targetImage->info().extent);
+        auto tSetup = std::chrono::high_resolution_clock::now();
 
         // Volumetric Lighting
-        Logger::info("[GPU-DBG] RTX dispatchVolumetrics BEGIN");
         dispatchVolumetrics(rtOutput);
-        Logger::info("[GPU-DBG] RTX dispatchVolumetrics END");
+        auto tVol = std::chrono::high_resolution_clock::now();
 
         // Path Tracing
-        Logger::info("[GPU-DBG] RTX dispatchPathTracing BEGIN");
         dispatchPathTracing(rtOutput);
-        Logger::info("[GPU-DBG] RTX dispatchPathTracing END");
+        auto tPT = std::chrono::high_resolution_clock::now();
 
         // Neural Radiance Cache
         m_common->metaNeuralRadianceCache().dispatchTrainingAndResolve(*this, rtOutput);
@@ -617,7 +613,8 @@ namespace dxvk {
 
         // ReSTIR GI
         m_common->metaReSTIRGIRayQuery().dispatch(this, rtOutput);
-        
+        auto tGI = std::chrono::high_resolution_clock::now();
+
         if (captureScreenImage && captureDebugImage) {
           takeScreenshot("baseReflectivity", rtOutput.m_primaryBaseReflectivity.image(Resources::AccessType::Read));
           takeScreenshot("sharedSubsurfaceData", rtOutput.m_sharedSubsurfaceData.image);
@@ -625,9 +622,8 @@ namespace dxvk {
         }
 
         // Demodulation
-        Logger::info("[GPU-DBG] RTX dispatchDemodulate BEGIN");
         dispatchDemodulate(rtOutput);
-        Logger::info("[GPU-DBG] RTX dispatchDemodulate END");
+        auto tDemod = std::chrono::high_resolution_clock::now();
 
         // Note: Primary direct diffuse/specular radiance textures noisy and in a demodulated state after demodulation step.
         if (captureScreenImage && captureDebugImage) {
@@ -636,9 +632,8 @@ namespace dxvk {
         }
 
         // Denoising
-        Logger::info("[GPU-DBG] RTX dispatchDenoise BEGIN");
         dispatchDenoise(rtOutput);
-        Logger::info("[GPU-DBG] RTX dispatchDenoise END");
+        auto tDenoise = std::chrono::high_resolution_clock::now();
 
         // Note: Primary direct diffuse/specular radiance textures denoised but in a still demodulated state after denoising step.
         if (captureScreenImage && captureDebugImage) {
@@ -647,13 +642,12 @@ namespace dxvk {
         }
 
         // Composition
-        Logger::info("[GPU-DBG] RTX dispatchComposite BEGIN");
         dispatchComposite(rtOutput);
-        Logger::info("[GPU-DBG] RTX dispatchComposite END");
+        auto tComposite = std::chrono::high_resolution_clock::now();
 
         // Post composite Debug View that may overwrite Composite output
         dispatchReplaceCompositeWithDebugView(rtOutput);
-        
+
         if (captureScreenImage && captureDebugImage) {
           takeScreenshot("rtxImagePostComposite", rtOutput.m_compositeOutput.resource(Resources::AccessType::Read).image);
         }
@@ -700,6 +694,22 @@ namespace dxvk {
         // conversion for 16bit float formats
         const bool performSRGBConversion = !captureScreenImage && g_allowSrgbConversionForOutput;
         dispatchToneMapping(rtOutput, performSRGBConversion);
+        auto tEnd = std::chrono::high_resolution_clock::now();
+
+        // Per-frame RTX pipeline chrono timing
+        {
+          auto us = [](auto a, auto b) { return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count(); };
+          Logger::info(str::format("[PERF-RTX] scene=", us(tScene0, tScene1),
+            "us setup=", us(tScene1, tSetup),
+            "us vol=", us(tSetup, tVol),
+            "us pathTrace=", us(tVol, tPT),
+            "us gi=", us(tPT, tGI),
+            "us demod=", us(tGI, tDemod),
+            "us denoise=", us(tDemod, tDenoise),
+            "us composite=", us(tDenoise, tComposite),
+            "us post=", us(tComposite, tEnd),
+            "us total=", us(tScene0, tEnd), "us"));
+        }
 
         if (captureScreenImage) {
           if (m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_DISABLED) {

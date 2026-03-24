@@ -111,6 +111,7 @@ namespace dxvk::vk {
   struct PresenterSync {
     VkSemaphore acquire;
     VkSemaphore present;
+    VkFence     fence = VK_NULL_HANDLE;
   };
 
   /**

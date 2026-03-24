@@ -78,6 +78,13 @@ namespace dxvk::vk {
 
     sync = m_semaphores.at(m_frameIndex);
 
+    // Wait for the fence to ensure the previous present that used this sync set
+    // has completed and the semaphores are safe to reuse.
+    if (sync.fence != VK_NULL_HANDLE) {
+      m_vkd->vkWaitForFences(m_vkd->device(), 1, &sync.fence, VK_TRUE, std::numeric_limits<uint64_t>::max());
+      m_vkd->vkResetFences(m_vkd->device(), 1, &sync.fence);
+    }
+
     // NV-DXVK start: DLFG integration
     if (isDlfgPresenting) {
       // DLFG manages swapchain images directly and can have more than one acquire outstanding at a time
@@ -144,6 +151,22 @@ namespace dxvk::vk {
     info.pResults           = nullptr;
 
     VkResult status = m_vkd->vkQueuePresentKHR(m_device.queue, &info);
+
+    // Signal the fence after present so the next use of this sync set
+    // can wait for the present semaphore to be fully consumed.
+    if (sync.fence != VK_NULL_HANDLE) {
+      VkSubmitInfo emptySubmit;
+      emptySubmit.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+      emptySubmit.pNext                = nullptr;
+      emptySubmit.waitSemaphoreCount   = 0;
+      emptySubmit.pWaitSemaphores      = nullptr;
+      emptySubmit.pWaitDstStageMask    = nullptr;
+      emptySubmit.commandBufferCount   = 0;
+      emptySubmit.pCommandBuffers      = nullptr;
+      emptySubmit.signalSemaphoreCount = 0;
+      emptySubmit.pSignalSemaphores    = nullptr;
+      m_vkd->vkQueueSubmit(m_device.queue, 1, &emptySubmit, sync.fence);
+    }
 
     if (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR)
       return status;
@@ -335,8 +358,13 @@ namespace dxvk::vk {
         return status;
     }
 
-    // Create one set of semaphores per swap image
-    m_semaphores.resize(m_info.imageCount);
+    // Use more semaphore sets than swap images to prevent reuse of a present
+    // semaphore while the presentation engine still holds a reference from a
+    // previous vkQueuePresentKHR. The DXVK submission queue can buffer up to
+    // MaxNumQueuedCommandBuffers entries, so we need enough sets to cover
+    // the maximum in-flight depth.
+    const uint32_t semaphoreCount = (m_info.imageCount + 2) > 6u ? (m_info.imageCount + 2) : 6u;
+    m_semaphores.resize(semaphoreCount);
 
     for (uint32_t i = 0; i < m_semaphores.size(); i++) {
       VkSemaphoreCreateInfo semInfo;
@@ -350,6 +378,15 @@ namespace dxvk::vk {
 
       if ((status = m_vkd->vkCreateSemaphore(m_vkd->device(),
           &semInfo, nullptr, &m_semaphores[i].present)) != VK_SUCCESS)
+        return status;
+
+      VkFenceCreateInfo fenceInfo;
+      fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+      fenceInfo.pNext = nullptr;
+      fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+
+      if ((status = m_vkd->vkCreateFence(m_vkd->device(),
+          &fenceInfo, nullptr, &m_semaphores[i].fence)) != VK_SUCCESS)
         return status;
 
       // NV-DXVK start: add debug names to VkImage objects
@@ -637,6 +674,8 @@ namespace dxvk::vk {
     for (const auto& sem : m_semaphores) {
       m_vkd->vkDestroySemaphore(m_vkd->device(), sem.acquire, nullptr);
       m_vkd->vkDestroySemaphore(m_vkd->device(), sem.present, nullptr);
+      if (sem.fence != VK_NULL_HANDLE)
+        m_vkd->vkDestroyFence(m_vkd->device(), sem.fence, nullptr);
     }
 
     m_vkd->vkDestroySwapchainKHR(m_vkd->device(), m_swapchain, nullptr);

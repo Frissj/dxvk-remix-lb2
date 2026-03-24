@@ -14,6 +14,7 @@
 #include "d3d9_rtx_utils.h"
 #include "d3d9_texture.h"
 #include "../dxvk/rtx_render/rtx_terrain_baker.h"
+#include <chrono>
 
 namespace dxvk {
   static const bool s_isDxvkResolutionEnvVarSet = (env::getEnvVar("DXVK_RESOLUTION_WIDTH") != "") || (env::getEnvVar("DXVK_RESOLUTION_HEIGHT") != "");
@@ -132,12 +133,34 @@ namespace dxvk {
   }
 
   DxvkBufferSlice allocVertexCaptureBuffer(DxvkDevice* pDevice, const VkDeviceSize size) {
-    DxvkBufferCreateInfo info;
-    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
-    info.access = VK_ACCESS_TRANSFER_READ_BIT;
-    info.stages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
-    info.size = size;
-    return DxvkBufferSlice(pDevice->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::AppBuffer, "Vertex Capture Buffer"));
+    // Ring buffer to avoid creating a new Vulkan buffer per draw call.
+    // We keep a pool of buffers and sub-allocate from them.
+    static thread_local struct {
+      Rc<DxvkBuffer> buffer;
+      VkDeviceSize offset = 0;
+      VkDeviceSize capacity = 0;
+    } s_pool;
+
+    constexpr VkDeviceSize kAlignment = 256; // conservative alignment for storage buffers
+    const VkDeviceSize alignedSize = align(size, kAlignment);
+
+    // Grow or wrap: allocate a new backing buffer
+    if (s_pool.buffer == nullptr || s_pool.offset + alignedSize > s_pool.capacity) {
+      // Size the buffer to hold many DCs worth of vertex data (4MB minimum)
+      constexpr VkDeviceSize kMinPoolSize = 4u * 1024u * 1024u;
+      s_pool.capacity = std::max(kMinPoolSize, alignedSize * 64);
+      DxvkBufferCreateInfo info;
+      info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+      info.access = VK_ACCESS_TRANSFER_READ_BIT;
+      info.stages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+      info.size = s_pool.capacity;
+      s_pool.buffer = pDevice->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::AppBuffer, "Vertex Capture Pool");
+      s_pool.offset = 0;
+    }
+
+    DxvkBufferSlice slice(s_pool.buffer, s_pool.offset, size);
+    s_pool.offset += alignedSize;
+    return slice;
   }
 
   void D3D9Rtx::prepareVertexCapture(const int vertexIndexOffset) {
@@ -183,14 +206,11 @@ namespace dxvk {
       geoData.texcoordBuffer = RasterBuffer(slice, texcoordOffset, stride, VK_FORMAT_R32G32_SFLOAT);
       assert(geoData.texcoordBuffer.offset() % 4 == 0);
     }
-    if (m_drawCallID < 200) {
-      Logger::info(str::format("[RTX-UVSource] DC#", m_drawCallID,
-        " forceInput=", forceInputTexcoords() ? 1 : 0,
+    ONCE(Logger::info(str::format("[RTX-UVSource] forceInput=", forceInputTexcoords() ? 1 : 0,
         " vsHasTC=", hasVsTexcoord ? 1 : 0,
         " inputTCDefined=", inputTexcoordDefined ? 1 : 0,
         " usingVSCapture=", useVsCapture ? 1 : 0,
-        " texcoordIdx=", m_texcoordIndex));
-    }
+        " texcoordIdx=", m_texcoordIndex)));
 
     // Check if we should/can get normals.  We don't see a lot of games sending normals to pixel shader, so we must capture from the IA output (or Vertex input)
     if ((BoundShaderHas(vertexShader, DxsoUsage::Normal, false) || BoundShaderHas(vertexShader, DxsoUsage::Normal, true)) && useVertexCapturedNormals()) {
@@ -325,7 +345,6 @@ namespace dxvk {
   }
 
   bool D3D9Rtx::processRenderState() {
-    Logger::info(str::format("[GPU-DBG] processRenderState DC#", m_drawCallID, " checkpoint=0_ENTER"));
     DrawCallTransforms& transformData = m_activeDrawCallState.transformData;
 
     // When games use vertex shaders, the object to world transforms can be unreliable, and so we can ignore them.
@@ -424,8 +443,6 @@ namespace dxvk {
       }
     }
 
-    Logger::info(str::format("[GPU-DBG] processRenderState DC#", m_drawCallID, " checkpoint=1_CAMERA_DONE"));
-
     transformData.objectToView = transformData.worldToView * transformData.objectToWorld;
 
     // Some games pass invalid matrices which D3D9 apparently doesnt care about.
@@ -459,8 +476,6 @@ namespace dxvk {
       }
     }
 
-    Logger::info(str::format("[GPU-DBG] processRenderState DC#", m_drawCallID, " checkpoint=2_CLIPS_DONE"));
-
     if (m_flags.test(D3D9RtxFlag::DirtyLights)) {
       m_flags.clr(D3D9RtxFlag::DirtyLights);
 
@@ -482,30 +497,8 @@ namespace dxvk {
         });
     }
 
-    Logger::info(str::format("[GPU-DBG] processRenderState DC#", m_drawCallID, " checkpoint=3_LIGHTS_DONE"));
-
-    Logger::info(str::format("[GPU-DBG] processRenderState DC#", m_drawCallID, " checkpoint=3_LIGHTS_STENCIL"));
-
     // Stencil state is important to Remix
     m_activeDrawCallState.stencilEnabled = d3d9State().renderStates[D3DRS_STENCILENABLE];
-
-    // Process textures - log which stages have textures bound for crash diagnosis
-    {
-      std::string boundTex;
-      for (int s = 0; s < 16; s++) {
-        if (d3d9State().textures[s] != nullptr) {
-          D3D9CommonTexture* ct = GetCommonTexture(d3d9State().textures[s]);
-          bool hasImg = ct && ct->GetImage() != nullptr;
-          boundTex += str::format(" s", s, "=", hasImg ? "ok" : "NOIMG");
-          if (ct && !hasImg) {
-            boundTex += str::format("(type=", (int)ct->GetType(), ")");
-          }
-        }
-      }
-      Logger::info(str::format("[GPU-DBG] processRenderState DC#", m_drawCallID,
-        " checkpoint=4_PRE_TEXTURES usesPS=", m_parent->UseProgrammablePS() ? 1 : 0,
-        boundTex));
-    }
 
     // Process textures
     if (m_parent->UseProgrammablePS()) {
@@ -776,53 +769,58 @@ namespace dxvk {
     m_activeDrawCallState.categories = 0;
     m_activeDrawCallState.materialData = {};
 
-    // === GPU DEBUG LOGGING (always on - need to catch crash) ===
-    const bool gpuDbgLog = true;
-    Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID,
-      " primType=", (uint32_t)drawContext.PrimitiveType,
-      " primCount=", drawContext.PrimitiveCount,
-      " vtxCount=", geoData.vertexCount,
-      " indexed=", drawContext.Indexed ? 1 : 0,
-      " usesVS=", m_parent->UseProgrammableVS() ? 1 : 0,
-      " usesPS=", m_parent->UseProgrammablePS() ? 1 : 0));
+    // === Per-frame chrono timing ===
+    static thread_local struct {
+      uint64_t legacyMatUs = 0, fogUs = 0, renderStateUs = 0, shaderExtractUs = 0;
+      uint64_t verticesUs = 0, hashBboxUs = 0, skinHashUs = 0, vtxCaptureUs = 0;
+      uint64_t texDbgUs = 0, categoriesUs = 0;
+      uint64_t totalUs = 0;
+      uint32_t dcCount = 0, dcSkipped = 0;
+      uint32_t lastFrameDC = UINT32_MAX;
+    } s_perf;
+    if (m_drawCallID < s_perf.lastFrameDC && s_perf.dcCount > 0) {
+      // New frame - dump previous frame stats
+      Logger::info(str::format("[PERF-DC] dcs=", s_perf.dcCount, " skip=", s_perf.dcSkipped,
+        " total=", s_perf.totalUs,
+        "us legacyMat=", s_perf.legacyMatUs, "us fog=", s_perf.fogUs,
+        "us renderState=", s_perf.renderStateUs, "us shaderExt=", s_perf.shaderExtractUs,
+        "us vertices=", s_perf.verticesUs, "us hashBbox=", s_perf.hashBboxUs,
+        "us skinHash=", s_perf.skinHashUs, "us vtxCapture=", s_perf.vtxCaptureUs,
+        "us categories=", s_perf.categoriesUs, "us"));
+      s_perf = {};
+    }
+    s_perf.lastFrameDC = m_drawCallID;
+    s_perf.dcCount++;
+    auto t0 = std::chrono::high_resolution_clock::now();
 
     // Fetch all the legacy state (colour modes, alpha test, etc...)
     setLegacyMaterialState(m_parent, m_parent->m_alphaSwizzleRTs & (1 << kRenderTargetIndex), m_activeDrawCallState.materialData);
-
-    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=LEGACY_MAT done"));
+    auto t1 = std::chrono::high_resolution_clock::now();
+    s_perf.legacyMatUs += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
 
     // Fetch fog state
-    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=FOG_STATE begin"));
     setFogState(m_parent, m_activeDrawCallState.fogState);
-    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=FOG_STATE done"));
+    auto t2 = std::chrono::high_resolution_clock::now();
+    s_perf.fogUs += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
 
     // Fetch all the render state and send it to rtx context (textures, transforms, etc.)
-    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=RENDER_STATE begin"));
     if (!processRenderState()) {
-      if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=RENDER_STATE SKIPPED"));
+      s_perf.dcSkipped++;
+      s_perf.renderStateUs += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - t2).count();
       return prepareFlagsForIgnoredDraws;
     }
-    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=RENDER_STATE done"));
+    auto t3 = std::chrono::high_resolution_clock::now();
+    s_perf.renderStateUs += std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count();
 
     // NV-DXVK start: extract material properties from programmable shader constants
     // Must be after processRenderState() so that textures are loaded and usesTexture() works
     try {
       extractShaderConstantMaterial(m_parent, m_activeDrawCallState.materialData);
-      if (gpuDbgLog) {
-        Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=SHADER_EXTRACT done",
-          " hasExtPBR=", m_activeDrawCallState.materialData.hasExtractedPBR ? 1 : 0,
-          " albedo=(", m_activeDrawCallState.materialData.extractedAlbedoColor[0],
-          ",", m_activeDrawCallState.materialData.extractedAlbedoColor[1],
-          ",", m_activeDrawCallState.materialData.extractedAlbedoColor[2], ")",
-          " rough=", m_activeDrawCallState.materialData.extractedRoughness,
-          " metal=", m_activeDrawCallState.materialData.extractedMetallic,
-          " emissI=", m_activeDrawCallState.materialData.extractedEmissiveIntensity,
-          " usesTex=", m_activeDrawCallState.materialData.usesTexture() ? 1 : 0,
-          " tFactor=0x", std::hex, m_activeDrawCallState.materialData.tFactor, std::dec));
-      }
     } catch (...) {
-      Logger::err(str::format("[GPU-DBG] DC#", m_drawCallID, " step=SHADER_EXTRACT EXCEPTION"));
+      Logger::err(str::format("[RTX-ShaderExtract] EXCEPTION at DC#", m_drawCallID));
     }
+    auto t4 = std::chrono::high_resolution_clock::now();
+    s_perf.shaderExtractUs += std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
     // NV-DXVK end
 
     // Max offseted index value within a buffer slice that geoData contains
@@ -830,26 +828,29 @@ namespace dxvk {
 
     // Copy all the vertices into a staging buffer.  Assign fields of the geoData structure.
     processVertices(vertexContext, vertexIndexOffset, geoData);
-    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=VERTICES done"));
+    auto t5 = std::chrono::high_resolution_clock::now();
+    s_perf.verticesUs += std::chrono::duration_cast<std::chrono::microseconds>(t5 - t4).count();
 
     geoData.futureGeometryHashes = computeHash(geoData, maxOffsetedIndex);
     geoData.futureBoundingBox = computeAxisAlignedBoundingBox(geoData);
-
-    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=HASH_BBOX done"));
+    auto t6 = std::chrono::high_resolution_clock::now();
+    s_perf.hashBboxUs += std::chrono::duration_cast<std::chrono::microseconds>(t6 - t5).count();
 
     // Process skinning data
     m_activeDrawCallState.futureSkinningData = processSkinning(geoData);
 
     // Hash material data
     m_activeDrawCallState.materialData.updateCachedHash();
-
-    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=SKIN_MATHASH done"));
+    auto t7 = std::chrono::high_resolution_clock::now();
+    s_perf.skinHashUs += std::chrono::duration_cast<std::chrono::microseconds>(t7 - t6).count();
 
     // For shader based drawcalls we also want to capture the vertex shader output
     const bool needVertexCapture = m_parent->UseProgrammableVS() && useVertexCapture();
     if (needVertexCapture) {
       prepareVertexCapture(vertexIndexOffset);
     }
+    auto t8 = std::chrono::high_resolution_clock::now();
+    s_perf.vtxCaptureUs += std::chrono::duration_cast<std::chrono::microseconds>(t8 - t7).count();
 
     m_activeDrawCallState.usesVertexShader = m_parent->UseProgrammableVS();
     m_activeDrawCallState.usesPixelShader = m_parent->UseProgrammablePS();
@@ -857,22 +858,14 @@ namespace dxvk {
     if (m_activeDrawCallState.usesVertexShader) {
       if (d3d9State().vertexShader != nullptr && d3d9State().vertexShader->GetCommonShader() != nullptr) {
         m_activeDrawCallState.programmableVertexShaderInfo = d3d9State().vertexShader->GetCommonShader()->GetInfo();
-      } else {
-        Logger::err(str::format("[GPU-DBG] DC#", m_drawCallID, " VS flagged but shader/common is NULL!",
-          " vsPtr=", (uintptr_t)d3d9State().vertexShader.ptr()));
       }
     }
 
     if (m_activeDrawCallState.usesPixelShader) {
       if (d3d9State().pixelShader != nullptr && d3d9State().pixelShader->GetCommonShader() != nullptr) {
         m_activeDrawCallState.programmablePixelShaderInfo = d3d9State().pixelShader->GetCommonShader()->GetInfo();
-      } else {
-        Logger::err(str::format("[GPU-DBG] DC#", m_drawCallID, " PS flagged but shader/common is NULL!",
-          " psPtr=", (uintptr_t)d3d9State().pixelShader.ptr()));
       }
     }
-
-    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=SHADER_INFO done"));
 
     // --- Texture/Shader Debug Capture ---
     if (g_texShaderDebug.enabled && !g_texShaderDebug.freezeFrame) {
@@ -966,8 +959,9 @@ namespace dxvk {
     assert(status == RtxGeometryStatus::RayTraced);
 
     const bool preserveOriginalDraw = needVertexCapture;
-
-    if (gpuDbgLog) Logger::info(str::format("[GPU-DBG] DC#", m_drawCallID, " step=COMPLETE camType=", (uint32_t)m_activeDrawCallState.cameraType));
+    auto tEnd = std::chrono::high_resolution_clock::now();
+    s_perf.categoriesUs += std::chrono::duration_cast<std::chrono::microseconds>(tEnd - t8).count();
+    s_perf.totalUs += std::chrono::duration_cast<std::chrono::microseconds>(tEnd - t0).count();
 
     return
       PrepareDrawFlag::CommitToRayTracing |
@@ -976,13 +970,24 @@ namespace dxvk {
   }
 
   void D3D9Rtx::triggerInjectRTX() {
+    static auto s_lastInject = std::chrono::high_resolution_clock::now();
+    auto tFlush0 = std::chrono::high_resolution_clock::now();
+    auto frameDelta = std::chrono::duration_cast<std::chrono::microseconds>(tFlush0 - s_lastInject).count();
+
     // Flush any pending game and RTX work
     m_parent->Flush();
+    auto tFlush1 = std::chrono::high_resolution_clock::now();
 
     // Send command to inject RTX
     m_parent->EmitCs([cReflexFrameId = GetReflexFrameId()](DxvkContext* ctx) {
       static_cast<RtxContext*>(ctx)->injectRTX(cReflexFrameId);
     });
+
+    auto tFlush2 = std::chrono::high_resolution_clock::now();
+    auto flushUs = std::chrono::duration_cast<std::chrono::microseconds>(tFlush1 - tFlush0).count();
+    auto emitUs = std::chrono::duration_cast<std::chrono::microseconds>(tFlush2 - tFlush1).count();
+    Logger::info(str::format("[PERF-FRAME] frameDelta=", frameDelta, "us flush=", flushUs, "us emit=", emitUs, "us"));
+    s_lastInject = tFlush0;
   }
 
   void D3D9Rtx::CommitGeometryToRT(const DrawContext& drawContext) {
@@ -1292,24 +1297,24 @@ namespace dxvk {
     // We need to find the real diffuse at a higher stage and use it instead of stage 0.
     int recommendedAlbedoSampler = -1;
 
-    Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " checkpoint=PT0_ENTER"));
-
-    // Periodic stage dump: log all DCs for one frame every 3 seconds
+    // Periodic stage dump: log first 20 DCs for one frame every 10 seconds
     {
       static auto s_lastDump = std::chrono::steady_clock::now();
       static bool s_dumping = false;
       static int s_prevDC = -1;
+      static int s_dumpCount = 0;
       auto now = std::chrono::steady_clock::now();
-      if (!s_dumping && std::chrono::duration_cast<std::chrono::seconds>(now - s_lastDump).count() >= 3) {
+      if (!s_dumping && std::chrono::duration_cast<std::chrono::seconds>(now - s_lastDump).count() >= 10) {
         s_dumping = true;
+        s_dumpCount = 0;
       }
       if (s_dumping && m_drawCallID <= s_prevDC) {
-        // Frame wrapped, stop dumping
         s_dumping = false;
         s_lastDump = now;
       }
       s_prevDC = m_drawCallID;
-      if (s_dumping) {
+      if (s_dumping && s_dumpCount < 20) {
+        s_dumpCount++;
         std::string stages;
         for (int s = 0; s < 16; s++) {
           if (d3d9State().textures[s] != nullptr) {
@@ -1361,7 +1366,6 @@ namespace dxvk {
           psConsts));
       }
     }
-    Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " checkpoint=PT1_STAGE_DUMP_DONE"));
     if constexpr (!FixedFunction) {
       if (forceTextureStage() < 0) {
         // TT Games engine: stage 0 = lightmap, stage 5 = diffuse.
@@ -1380,17 +1384,11 @@ namespace dxvk {
             continue;
 
           recommendedAlbedoSampler = slot;
-          if (m_drawCallID < 50) {
-            Logger::info(str::format("[RTX-RTReplace] DC#", m_drawCallID,
-              " -> using slot ", slot, " (", descC->Width, "x", descC->Height, ")"));
-          }
+          ONCE(Logger::info(str::format("[RTX-RTReplace] using slot ", slot, " (", descC->Width, "x", descC->Height, ")")));
           break;
         }
       }
     }
-
-    Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID,
-      " checkpoint=PT2_PRE_LOOP recAlbedo=", recommendedAlbedoSampler));
 
     for (uint32_t idx = 0, textureID = 0; idx < NumTexcoordBins && textureID < LegacyMaterialData::kMaxSupportedTextures; idx++) {
       uint8_t stage;
@@ -1451,34 +1449,22 @@ namespace dxvk {
       ++textureID;
     }
 
-    Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " checkpoint=PT3_LOOP_DONE firstStage=", firstStage));
-
     // TT Games engine: populate extra material maps from higher texture stages
     // s6 = normal map, s7 = specular/roughness map
     if constexpr (!FixedFunction) {
       auto trySetExtraTexture = [&](int stageIdx, TextureRef& outRef) {
-        Logger::info(str::format("[GPU-DBG] trySetExtraTexture DC#", m_drawCallID, " stage=", stageIdx));
         if (d3d9State().textures[stageIdx] == nullptr)
           return;
         D3D9CommonTexture* tex = GetCommonTexture(d3d9State().textures[stageIdx]);
         if (tex == nullptr)
           return;
         const auto* desc = tex->Desc();
-        Logger::info(str::format("[GPU-DBG] trySetExtraTexture DC#", m_drawCallID, " stage=", stageIdx,
-          " size=", desc->Width, "x", desc->Height, " isRT=", tex->IsRenderTarget() ? 1 : 0));
-        // Skip tiny utility textures and render targets
         if (desc->Width <= 1 && desc->Height <= 1)
           return;
         if (tex->IsRenderTarget() || tex->IsDepthStencil())
           return;
-        // Skip if hash is 0 (blank texture)
-        if (tex->GetImage() == nullptr) {
-          Logger::err(str::format("[GPU-DBG] trySetExtraTexture DC#", m_drawCallID, " stage=", stageIdx, " NULL GetImage!"));
+        if (tex->GetImage() == nullptr || tex->GetImage()->getHash() == 0)
           return;
-        }
-        if (tex->GetImage()->getHash() == 0)
-          return;
-        // Skip if same texture as diffuse (s5) — no separate map
         if (recommendedAlbedoSampler >= 0 && d3d9State().textures[recommendedAlbedoSampler] != nullptr) {
           D3D9CommonTexture* diffTex = GetCommonTexture(d3d9State().textures[recommendedAlbedoSampler]);
           if (diffTex && diffTex->GetImage() != nullptr && tex->GetImage()->getHash() == diffTex->GetImage()->getHash())
@@ -1486,12 +1472,9 @@ namespace dxvk {
         }
         const bool srgb = d3d9State().samplerStates[stageIdx][D3DSAMP_SRGBTEXTURE] & 0x1;
         outRef = TextureRef(tex->GetSampleView(srgb));
-        Logger::info(str::format("[GPU-DBG] trySetExtraTexture DC#", m_drawCallID, " stage=", stageIdx, " SET OK"));
       };
 
-      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT3a_PRE_EXTRA_TEX"));
       trySetExtraTexture(6, m_activeDrawCallState.materialData.normalMapTexture);
-      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT3b_POST_EXTRA_TEX"));
 
       // Detect additive blend (SRCALPHA + ONE) = glow/emissive pass
       const bool blendOn = d3d9State().renderStates[D3DRS_ALPHABLENDENABLE] != 0;
@@ -1499,28 +1482,17 @@ namespace dxvk {
       const DWORD dstB = d3d9State().renderStates[D3DRS_DESTBLEND];
       // D3DBLEND_SRCALPHA=5, D3DBLEND_ONE=2
       m_activeDrawCallState.materialData.ttIsAdditiveBlend = blendOn && (dstB == D3DBLEND_ONE);
-      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT3c_BLEND_DONE additive=", m_activeDrawCallState.materialData.ttIsAdditiveBlend ? 1 : 0));
     }
 
     // Update the drawcall state with texture stage info
-    Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT4_PRE_setTextureStageState firstStage=", firstStage,
-      " useTFactor=", useStageTextureFactorBlending ? 1 : 0, " useMultiTFactor=", useMultipleStageTextureFactorBlending ? 1 : 0));
     setTextureStageState(d3d9State(), firstStage, useStageTextureFactorBlending, useMultipleStageTextureFactorBlending,
                          m_activeDrawCallState.materialData, m_activeDrawCallState.transformData);
-    Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT5_POST_setTextureStageState"));
 
     if (d3d9State().textures[firstStage]) {
-      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT6_PRE_setupCategories"));
       m_activeDrawCallState.setupCategoriesForTexture();
-      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT7_POST_setupCategories"));
 
       // Track the texture hash before checking if it should be ignored
-      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT8_PRE_getColorTexture"));
-      const auto& colorTex = m_activeDrawCallState.materialData.getColorTexture();
-      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT8a_colorTex valid=", colorTex.isValid() ? 1 : 0,
-        " empty=", colorTex.isImageEmpty() ? 1 : 0));
-      const XXH64_hash_t textureHash = colorTex.getImageHash();
-      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT9_hash=0x", std::hex, textureHash, std::dec));
+      const XXH64_hash_t textureHash = m_activeDrawCallState.materialData.getColorTexture().getImageHash();
 
       // Flag smooth normals category at the d3d9 layer
       m_activeDrawCallState.setCategory(InstanceCategories::SmoothNormals, lookupHash(RtxOptions::smoothNormalsTextures(), textureHash));
@@ -1529,11 +1501,9 @@ namespace dxvk {
           static_cast<RtxContext*>(ctx)->getSceneManager().trackReplacementMaterialHash(textureHash);
         });
       }
-      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT10_POST_trackHash"));
 
       // Check if an ignore texture is bound
       if (m_activeDrawCallState.getCategoryFlags().test(InstanceCategories::Ignore)) {
-        Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT_IGNORE returning false"));
         return false;
       }
 
@@ -1555,33 +1525,19 @@ namespace dxvk {
       if (!m_forceGeometryCopy && RtxOptions::alwaysCopyDecalGeometries()) {
         m_forceGeometryCopy |= m_activeDrawCallState.testCategoryFlags(CATEGORIES_REQUIRE_GEOMETRY_COPY);
       }
-      Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT11_POST_categories"));
     }
 
-    Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT12_PRE_texcoordIndex firstStage=", firstStage));
     if (forceTexcoordIndex() >= 0) {
       m_texcoordIndex = forceTexcoordIndex();
     } else {
       m_texcoordIndex = d3d9State().textureStages[firstStage][DXVK_TSS_TEXCOORDINDEX];
     }
-    Logger::info(str::format("[GPU-DBG] processTextures DC#", m_drawCallID, " PT13_DONE texcoordIdx=", m_texcoordIndex));
 
-    // Log texture selection details — show all stages so user can identify RT hashes
-    if (!FixedFunction && m_drawCallID < 50) {
-      Logger::info(str::format("[RTX-TexSelect] DC#", m_drawCallID,
-        " firstStage=", firstStage,
+    // Log texture selection details once
+    if constexpr (!FixedFunction) {
+      ONCE(Logger::info(str::format("[RTX-TexSelect] firstStage=", firstStage,
         " texcoordIndex=", m_texcoordIndex,
-        " albedoSlot=", recommendedAlbedoSampler));
-      for (uint32_t s = 0; s < caps::MaxSimultaneousTextures; s++) {
-        if (d3d9State().textures[s] != nullptr) {
-          D3D9CommonTexture* ct = GetCommonTexture(d3d9State().textures[s]);
-          Logger::info(str::format("[RTX-TexStages] DC#", m_drawCallID,
-            " stage=", s,
-            " ", ct->Desc()->Width, "x", ct->Desc()->Height,
-            " hash=0x", std::hex, ct->GetImage()->getHash(), std::dec,
-            " descHash=0x", std::hex, ct->GetImage()->getDescriptorHash(), std::dec));
-        }
-      }
+        " albedoSlot=", recommendedAlbedoSampler)));
     }
 
     return true;

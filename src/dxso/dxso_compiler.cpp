@@ -942,9 +942,14 @@ namespace dxvk {
           break;
       }
 
+      // Use Depth=2 ("no indication") for shadow sampler variants instead of Depth=1.
+      // D3D9 allows binding any texture to any sampler type, and the actual depth
+      // comparison is controlled by the sampler's compareEnable at runtime via spec
+      // constant. Depth=1 causes validation errors when a color texture is bound to
+      // a slot that has a shadow sampler variant declared in the SPIR-V.
       sampler.imageTypeId = m_module.defImageType(
         m_module.defFloatType(32),
-        dimensionality, depth ? 1 : 0, 0, 0, 1,
+        dimensionality, depth ? 2 : 0, 0, 0, 1,
         spv::ImageFormatUnknown);
 
       sampler.typeId = m_module.defSampledImageType(sampler.imageTypeId);
@@ -968,7 +973,7 @@ namespace dxvk {
     const bool implicit = m_programInfo.majorVersion() < 2 || m_moduleInfo.options.forceSamplerTypeSpecConstants;
 
     if (!implicit) {
-      DxsoSamplerType samplerType = 
+      DxsoSamplerType samplerType =
         SamplerTypeFromTextureType(type);
 
       DclSampler(idx, binding, samplerType, false, implicit);

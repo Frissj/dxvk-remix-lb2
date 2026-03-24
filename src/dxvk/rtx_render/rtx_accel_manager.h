@@ -59,11 +59,15 @@ class AccelManager : public CommonDeviceObject {
     uint32_t reorderedSurfacesOffset = UINT32_MAX;
     bool hasOmmInstances = false;
     bool hasSssInstances = false;
-    
+
     // Tries to add a geometry instance to the bucket. The addition is successful if either:
     //   a) the bucket is empty,
     //   b) the instance has the same mask etc. as all other instances in the bucket.
     bool tryAddInstance(RtInstance* instance);
+
+    // Compute a hash key from the compatibility fields used by tryAddInstance.
+    // Two instances are merge-compatible iff they produce the same key.
+    static uint64_t computeBucketKey(const RtInstance* instance);
   };
 
 public:

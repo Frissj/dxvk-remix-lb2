@@ -115,10 +115,28 @@ namespace dxvk {
   };
   // NV-DXVK end
 
-  bool filterErrorMessages(const char* message) {
+  bool filterErrorMessages(const char* message, int32_t messageIdNumber = 0) {
+    // Fast path: filter by numeric message ID directly.
+    // Newer Vulkan SDKs (1.4.313+) no longer embed "MessageID = 0x..." in the
+    // message text, so the regex-based filter below can miss known errors.
+    constexpr std::array<int32_t, 5> ignoredMessageIds{
+      0x335edc9a,   // renderpass vs. FB/PSO incompatibilities
+      (int32_t)0x8cb637c2u,   // renderpass vs. FB/PSO incompatibilities
+      0x50685725,   // renderpass vs. FB/PSO incompatibilities
+      0x4b9d1597,   // Depth comparison on non-depth image (vkCmdDraw)
+      0x534c50ad,   // Depth comparison on non-depth image (vkCmdDrawIndexed)
+    };
+
+    if (messageIdNumber != 0) {
+      for (auto id : ignoredMessageIds) {
+        if (messageIdNumber == id)
+          return true;
+      }
+    }
+
     // validation errors that we are currently ignoring --- to fix!
     constexpr std::array ignoredErrors{
-      // renderpass vs. FB/PSO incompatibilities
+      // renderpass vs. FB/PSO incompatibilities (legacy text matching)
       "MessageID = 0x335edc9a",
       "MessageID = 0x8cb637c2",
       "MessageID = 0x50685725",
@@ -280,10 +298,10 @@ namespace dxvk {
     const bool showFilteredErrorsAsWarnings = false; // Set it to true to ouput the waived errors as warnings rather than skipping them entirely
     const bool shouldFilterDuplicateMessages = true;
 
-    bool isWaivedError = 
-      shouldFilterErrors && 
+    bool isWaivedError =
+      shouldFilterErrors &&
       (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) &&
-      filterErrorMessages(pMsg);
+      filterErrorMessages(pMsg, pCallbackData->messageIdNumber);
 
     // Only filter duplicate messages that end up being shown since duplicate filtering is constrained in size for performance
     if (!isWaivedError || showFilteredErrorsAsWarnings) {    

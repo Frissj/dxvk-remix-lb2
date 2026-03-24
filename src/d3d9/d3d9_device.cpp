@@ -20,6 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include "d3d9_device.h"
+#include <chrono>
 
 #include "d3d9_interface.h"
 #include "d3d9_swapchain.h"
@@ -2588,6 +2589,41 @@ namespace dxvk {
   }
 
 
+  // Per-frame D3D9 overhead tracker
+  static struct FrameOverheadTracker {
+    uint64_t drawTotalUs = 0;     // Total time inside Draw/DrawIndexed calls
+    uint64_t prepareTexUs = 0;    // PrepareTextures
+    uint64_t prepareDrawUs = 0;   // PrepareDraw (DXVK state binding)
+    uint64_t commitUs = 0;        // CommitGeometryToRT
+    uint64_t lockUs = 0;          // LockDevice overhead
+    uint32_t drawCount = 0;
+    uint32_t nonDrawCalls = 0;    // SetRenderState, SetTexture, etc.
+    std::chrono::high_resolution_clock::time_point frameStart;
+    bool started = false;
+
+    void reset() {
+      drawTotalUs = prepareTexUs = prepareDrawUs = commitUs = lockUs = 0;
+      drawCount = nonDrawCalls = 0;
+      frameStart = std::chrono::high_resolution_clock::now();
+      started = true;
+    }
+    void dump() {
+      if (!started) return;
+      auto now = std::chrono::high_resolution_clock::now();
+      auto frameUs = std::chrono::duration_cast<std::chrono::microseconds>(now - frameStart).count();
+      auto otherUs = (int64_t)frameUs - (int64_t)drawTotalUs;
+      Logger::info(str::format("[PERF-D3D9] frame=", frameUs,
+        "us draws=", drawCount,
+        " drawTotal=", drawTotalUs,
+        "us prepTex=", prepareTexUs,
+        "us prepDraw=", prepareDrawUs,
+        "us commit=", commitUs,
+        "us lock=", lockUs,
+        "us nonDrawAPICalls=", nonDrawCalls,
+        " gameLogic+present=", otherUs, "us"));
+    }
+  } s_d3d9Overhead;
+
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawPrimitive(
           D3DPRIMITIVETYPE PrimitiveType,
           UINT             StartVertex,
@@ -2647,8 +2683,11 @@ namespace dxvk {
           UINT             StartIndex,
           UINT             PrimitiveCount) {
     ScopedCpuProfileZone();
+    auto tDraw0 = std::chrono::high_resolution_clock::now();
 
     D3D9DeviceLock lock = LockDevice();
+    auto tLock = std::chrono::high_resolution_clock::now();
+    s_d3d9Overhead.lockUs += std::chrono::duration_cast<std::chrono::microseconds>(tLock - tDraw0).count();
 
     if (unlikely(m_state.vertexDecl == nullptr))
       return D3DERR_INVALIDCALL;
@@ -2659,6 +2698,8 @@ namespace dxvk {
     // NV-DXVK start: geometry processing
     const D3D9Rtx::DrawContext drawContext = { PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, StartIndex, PrimitiveCount, TRUE };
     const PrepareDrawFlags drawPrepare = m_rtx.PrepareDrawGeometryForRT(true, drawContext);
+    auto tPrepGeo = std::chrono::high_resolution_clock::now();
+    s_d3d9Overhead.prepareTexUs += std::chrono::duration_cast<std::chrono::microseconds>(tPrepGeo - tLock).count();
 
     if ((drawPrepare & PrepareDrawFlag::ApplyDrawState) ||
         (drawPrepare & PrepareDrawFlag::OriginalDrawCall)) {
@@ -2685,10 +2726,16 @@ namespace dxvk {
         }
       });
     }
+    auto tPrep = std::chrono::high_resolution_clock::now();
+    s_d3d9Overhead.prepareDrawUs += std::chrono::duration_cast<std::chrono::microseconds>(tPrep - tPrepGeo).count();
 
     if (drawPrepare & PrepareDrawFlag::CommitToRayTracing) {
       m_rtx.CommitGeometryToRT(drawContext);
     }
+    auto tCommit = std::chrono::high_resolution_clock::now();
+    s_d3d9Overhead.commitUs += std::chrono::duration_cast<std::chrono::microseconds>(tCommit - tPrep).count();
+    s_d3d9Overhead.drawTotalUs += std::chrono::duration_cast<std::chrono::microseconds>(tCommit - tDraw0).count();
+    s_d3d9Overhead.drawCount++;
     // NV-DXVK end
 
     return D3D_OK;
@@ -3748,12 +3795,20 @@ namespace dxvk {
           DWORD dwFlags) {
     ScopedCpuProfileZone();
 
+    s_d3d9Overhead.dump();
+
+    auto tPresent0 = std::chrono::high_resolution_clock::now();
     HRESULT result = m_implicitSwapchain->Present(
       pSourceRect,
       pDestRect,
       hDestWindowOverride,
       pDirtyRegion,
       dwFlags);
+    auto tPresent1 = std::chrono::high_resolution_clock::now();
+    Logger::info(str::format("[PERF-PRESENT] swap=",
+      std::chrono::duration_cast<std::chrono::microseconds>(tPresent1 - tPresent0).count(), "us"));
+
+    s_d3d9Overhead.reset();
 
     return result;
   }

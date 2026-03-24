@@ -305,24 +305,6 @@ namespace dxvk {
 
     const Direct3DState9& d3d9State = *pDevice->GetRawState();
 
-    // Debug: log first 5 calls to verify CTAB access works
-    {
-      static uint32_t s_debugCount = 0;
-      if (s_debugCount < 5) {
-        s_debugCount++;
-        bool hasPS = d3d9State.pixelShader != nullptr;
-        bool hasVS = d3d9State.vertexShader != nullptr;
-        size_t psCtabSize = 0, vsCtabSize = 0;
-        if (hasPS && d3d9State.pixelShader->GetCommonShader())
-          psCtabSize = d3d9State.pixelShader->GetCommonShader()->GetCtab().m_constantData.size();
-        if (hasVS && d3d9State.vertexShader->GetCommonShader())
-          vsCtabSize = d3d9State.vertexShader->GetCommonShader()->GetCtab().m_constantData.size();
-        Logger::info(str::format("[RTX-ExtractDebug] call#", s_debugCount,
-          " hasPS=", hasPS ? 1 : 0, " hasVS=", hasVS ? 1 : 0,
-          " psCtab=", psCtabSize, " vsCtab=", vsCtabSize));
-      }
-    }
-
     // When using shader constant extraction, the game's ubershader handles lighting -
     // vertex colors are actual vertex colors, not baked lighting
     materialData.isVertexColorBakedLighting = false;

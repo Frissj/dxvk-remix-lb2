@@ -904,15 +904,38 @@ namespace dxvk {
     const bool useGPU = input.vertexCount > kNumVerticesToProcessOnCPU || mustUseGPU;
 
     if (useGPU) {
+      // Helper: bind a buffer slice with its offset aligned down to minStorageBufferOffsetAlignment (16 bytes).
+      // Returns the extra byte offset that was trimmed, so the caller can add it to the push constant offset.
+      constexpr VkDeviceSize kSsboAlign = 16;
+      auto bindAligned = [&](uint32_t slot, const DxvkBufferSlice& slice) -> uint32_t {
+        VkDeviceSize sliceOffset = slice.offset();
+        VkDeviceSize alignedOffset = sliceOffset & ~(kSsboAlign - 1);
+        uint32_t extraBytes = uint32_t(sliceOffset - alignedOffset);
+        if (extraBytes == 0) {
+          ctx->bindResourceBuffer(slot, slice);
+        } else {
+          // Re-create the slice at the aligned offset with expanded length
+          ctx->bindResourceBuffer(slot, DxvkBufferSlice(slice.buffer(), alignedOffset, slice.length() + extraBytes));
+        }
+        return extraBytes;
+      };
+
       ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_OUTPUT, DxvkBufferSlice(output.buffer));
 
-      ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_POSITION_INPUT, input.positionBuffer);
-      if (args.hasNormals)
-        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT, input.normalBuffer);
-      if (args.hasTexcoord)
-        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT, input.texcoordBuffer);
-      if (args.hasColor0)
-        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT, input.color0Buffer);
+      uint32_t extraPos = bindAligned(INTERLEAVE_GEOMETRY_BINDING_POSITION_INPUT, input.positionBuffer);
+      args.positionOffset += extraPos / 4;
+      if (args.hasNormals) {
+        uint32_t extraNrm = bindAligned(INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT, input.normalBuffer);
+        args.normalOffset += extraNrm / 4;
+      }
+      if (args.hasTexcoord) {
+        uint32_t extraTex = bindAligned(INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT, input.texcoordBuffer);
+        args.texcoordOffset += extraTex / 4;
+      }
+      if (args.hasColor0) {
+        uint32_t extraClr = bindAligned(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT, input.color0Buffer);
+        args.color0Offset += extraClr / 4;
+      }
 
       ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 
